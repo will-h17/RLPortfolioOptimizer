@@ -5,12 +5,14 @@ Data loading and preprocessing utilities.
 2) Load cached CVSs, align by date, keep *adjusted close* for total return consistency
 3) Fill missing data by forward-filling, then drop NaNs
 4) Persist a clean price matrix (Parquet) under data/processed/."""
+from __future__ import annotations
 
 import os
-import requests
-
-from typing import Optional
+import time
+from typing import Optional, List
 from pathlib import Path
+
+import requests
 
 RAW_DIR = os.path.join("data", "raw")
 PROC_DIR = os.path.join("data", "processed")
@@ -64,11 +66,18 @@ def av_daily_adjusted(
 
     return path
 
-def download_universe():
+def download_universe(symbols: List[str], sleep_sec: float = 12.5, force: bool = False, api_key: Optional[str] = None) -> List[Path]:
     """
     Download and cache all symbols in the universe
     """
-    pass
+    paths: List[Path] = []
+    for i, symbol in enumerate(symbols):
+        p = av_daily_adjusted(symbol, api_key=api_key, force=force)
+        paths.append(p)
+        # Sleep between requests, not after the last one
+        if i < len(symbols) - 1:
+            time.sleep(sleep_sec)
+    return paths
 
 def load_and_merge():
     """
