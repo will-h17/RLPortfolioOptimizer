@@ -8,7 +8,9 @@ Data loading and preprocessing utilities.
 
 import os
 
-def _get_api_key():
+from typing import Optional
+
+def _get_api_key(explicit_key: Optional[str] = None) -> str:
     """Retrieve Alpha Vantage API key from environment variable."""
     key = explicit_key = os.getenv("ALPHAVANTAGE_API_KEY")
     if not key:
@@ -16,3 +18,21 @@ def _get_api_key():
             "Alpha Vantage API key not found. Please set the ALPHAVANTAGE_API_KEY environment variable."
         )
     return key
+
+def av_daily_adjusted():
+    """
+    Download alpha vantage DAILY_ADJUSTED for one symbol and cache to CSV
+    """
+    pass
+
+def download_universe():
+    """
+    Download and cache all symbols in the universe
+    """
+    pass
+
+def load_and_merge():
+    """
+    Load all cached CSVs, align by date, keep adjusted close
+    """
+    pass
