@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import os
 import time
+import pandas as pd
 from typing import Optional, List
 from pathlib import Path
 
@@ -79,8 +80,43 @@ def download_universe(symbols: List[str], sleep_sec: float = 12.5, force: bool =
             time.sleep(sleep_sec)
     return paths
 
-def load_and_merge():
+def load_and_merge(symbols: List[str],
+                   rawdir: Path | str = RAW_DIR,
+                   processed: Path | str = PROC_DIR,
+                   out_name: str = "prices_adj.parquet",
+                   forward_fill: bool = True) -> pd.DataFrame:
     """
     Load all cached CSVs, align by date, keep adjusted close
     """
-    pass
+    rawdir = Path(rawdir)
+    processed = Path(processed)
+    processed.mkdir(parents=True, exist_ok=True)
+
+    dfs = []
+    for sym in symbols:
+        path = rawdir / f"{sym}_daily_adjusted.csv"
+        if not path.exists():
+            raise FileNotFoundError(f"File {path} does not exist. Please download the data first.")
+        df = pd.read_csv(path, parse_dates=["timestamp"])
+        # Keep the columns we trust downstream
+        df = df.rename(
+            columns={"timestamp": "date", "adjusted_close": sym}
+        )[["date", sym]].sort_values("date")
+        dfs.append(df)
+
+    # Outer join to keep all dates
+    merged = dfs[0]
+    for df in dfs[1:]:
+        merged = merged.merge(df, on="date", how="outer")
+
+    merged = merged.sort_values("date").set_index("date")
+    if forward_fill:
+        merged = merged.ffill()
+
+    # Drop any remaining NaNs (e.g. leading NaNs)
+    merged = merged.dropna(how="any")
+
+    out_path = processed / out_name
+    merged.to_parquet(out_path)
+
+    return merged
