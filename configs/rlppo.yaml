@@ -1,0 +1,48 @@
+run_name: "ppo_dirichlet_baseline"
+
+seed: 123
+paths:
+  prices: "data/processed/prices_adj.parquet"
+  features: "data/processed/features.parquet"
+  out_root: "artifacts"          # all run folders will live under here
+
+dates:
+  train_end: "2020-10-30"
+  val_end:   "2020-12-31"
+  test_end:  "2021-03-31"
+
+env:
+  transaction_cost_bps: 0        # keep for backwrads compatability (unused when cost_model.enabled=true)
+  include_cash: true
+  cash_rate_annual: 0.02         # simple annualized cash rate (optional)
+
+reward:
+  return_weight: 1.0
+  turnover_penalty: 0.0          # increase later (e.g., 1e-3) if we want to curb churn
+  drawdown_penalty: 0.0          # optional, depends on our env design
+  volatility_penalty: 0.0
+
+ppo:
+  learning_rate: 0.0003
+  gamma: 0.99
+  gae_lambda: 0.95
+  n_steps: 2048
+  batch_size: 256
+  clip_range: 0.2
+  ent_coef: 0.0
+  policy_hidden_sizes: [128, 128]
+
+train:
+  total_timesteps: 200000
+  checkpoint_freq: 50000
+  eval_freq: 20000
+
+cost_model:
+  enabled: true
+  fee_bps: 0.0                    # explicit commissions/fees (per unit of notional turned over)
+  slippage_bps: 0.0               # residual price impact not captured by spread
+  spread:
+    type: "vol20"                 # "fixed" | "vol20"
+    fixed_bps: 2.0                # used only if type == "fixed"
+    k_vol_to_bps: 8000.0          # bps per 1.0 daily vol; e.g., vol=0.01 -> ~80 bps
+    vol_col_suffix: "_s20"        # feature column suffix for 20d rolling std of returns per asset (e.g., AAPL_s20)

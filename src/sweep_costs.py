@@ -1,0 +1,175 @@
+from __future__ import annotations
+import argparse
+from pathlib import Path
+import numpy as np
+import pandas as pd
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
+from stable_baselines3.common.monitor import Monitor
+
+from src.config_loader import load_config
+from src.runlog import RunRecorder
+from src.scaler import FitOnTrainScaler
+from src.env import PortfolioEnv, EnvConfig
+from src.splits import date_slices
+
+def _align_after_load(prices: pd.DataFrame, feats: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
+    # keep only rows where features are fully ready, then intersect indices
+    feats = feats.dropna(how="any")
+    common = prices.index.intersection(feats.index)
+    if len(common) == 0:
+        raise ValueError("No common timestamps after dropping NaNs in features.")
+    prices = prices.loc[common]
+    feats  = feats.loc[common]
+    print(f"[data] usable rows: {len(common)} from {common.min().date()} to {common.max().date()}")
+    return prices, feats
+
+def _clamp_dates_to_index(idx: pd.DatetimeIndex, train_end: str, val_end: str, test_end: str) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    dmin, dmax = idx.min().normalize(), idx.max().normalize()
+    t_end  = min(max(pd.to_datetime(train_end).normalize(), dmin), dmax)
+    v_end  = min(max(pd.to_datetime(val_end).normalize(),   dmin), dmax)
+    te_end = min(max(pd.to_datetime(test_end).normalize(),  dmin), dmax)
+    if not (t_end <= v_end <= te_end):
+        # simple 70/15/15 fallback
+        n = len(idx)
+        i_tr = max(1, int(0.70 * n) - 1)
+        i_va = max(i_tr + 1, int(0.85 * n) - 1)
+        t_end, v_end, te_end = idx[i_tr].normalize(), idx[i_va].normalize(), idx[-1].normalize()
+        print("[dates] invalid order; using 70/15/15 fallback.")
+    return t_end, v_end, te_end
+
+def _load_data(cfg):
+    prices = pd.read_parquet(cfg.paths.prices)
+    feats  = pd.read_parquet(cfg.paths.features)
+
+    prices, feats = _align_after_load(prices, feats)
+
+    # clamp to usable range and do **mask-based** split, same as train.py
+    t_end, v_end, te_end = _clamp_dates_to_index(feats.index, cfg.dates.train_end, cfg.dates.val_end, cfg.dates.test_end)
+    print(f"[dates] using train_end={t_end.date()}, val_end={v_end.date()}, test_end={te_end.date()}")
+
+    idx = prices.index
+    m_train = (idx <= t_end)
+    m_val   = (idx > t_end) & (idx <= v_end)
+    m_test  = (idx > v_end) & (idx <= te_end)
+
+    P_te = prices.loc[m_test]
+    X_te = feats.loc[m_test]
+
+    print(f"[split] test={len(P_te)}  span {P_te.index.min().date() if len(P_te) else '—'} → {P_te.index.max().date() if len(P_te) else '—'}")
+    if len(P_te) == 0:
+        raise ValueError("Empty TEST split after clamping; adjust your dates.")
+
+    # also return the full (aligned) raw features so we can pass vol columns to cost model if needed
+    return prices, feats, P_te, X_te
+
+def _make_env(P, X, env_cfg: EnvConfig, seed: int):
+    def _init():
+        return Monitor(PortfolioEnv(P, X, env_cfg))
+    return _init
+
+def _rollout(best_model, env):
+    import numpy as np
+    obs = env.reset()
+    done = [False]
+    rets = []
+    weights = []
+    steps = 0
+
+    while True:
+        action, _ = best_model.predict(obs, deterministic=True)
+        obs, reward, done, info = env.step(action)
+
+        # Always record reward as the per-step net return
+        rets.append(float(np.asarray(reward).ravel()[0]))
+
+        # Record weights if your env exposes them
+        if info and "weights" in info[0]:
+            weights.append(np.asarray(info[0]["weights"], dtype=float))
+
+        steps += 1
+        if done[0]:
+            break
+
+    return np.asarray(rets, dtype=float), weights
+
+
+def _metrics(rets: np.ndarray, weights_seq: list[np.ndarray]) -> dict:
+    eq = (1.0 + rets).cumprod()
+    sharpe = float(np.sqrt(252.0) * rets.mean() / (rets.std() + 1e-12)) if len(rets)>1 else 0.0
+    mdd = float((eq / np.maximum.accumulate(eq) - 1.0).min()) if len(eq)>1 else 0.0
+    if len(weights_seq) >= 2:
+        W = np.vstack(weights_seq)
+        turnover = float(np.abs(np.diff(W, axis=0)).sum(axis=1).mean())
+    else:
+        turnover = 0.0
+    return {"sharpe": sharpe, "max_drawdown": mdd, "turnover": turnover}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", required=True, help="Path to YAML/JSON config")
+    ap.add_argument("--run_dir", required=True, help="Run folder that contains models/best/best_model.zip and scaler.json")
+    ap.add_argument("--out_csv", default="cost_sweep.csv")
+    args = ap.parse_args()
+
+    cfg = load_config(args.config)
+    run_dir = Path(args.run_dir)
+    best_zip = run_dir / "models" / "best" / "best_model.zip"
+    scaler_path = run_dir / "scaler.json"
+
+    # Load & split like train.py does
+    prices_all, feats_all, P_te, X_te = _load_data(cfg)
+
+    # Load scaler from the run and transform TEST features
+    from src.scaler import FitOnTrainScaler
+    # Scale TEST features with the **train-fitted** scaler from this run
+    scaler = FitOnTrainScaler.load(scaler_path, columns=X_te.columns)
+    X_tez = scaler.transform(X_te)
+
+    # Final defensive alignment (indices should already match, but be explicit)
+    common = P_te.index.intersection(X_tez.index)
+    P_te   = P_te.loc[common]
+    X_tez  = X_tez.loc[common]
+    print(f"[sweep] final test rows after align: {len(common)}")
+
+    # Load policy
+    best = PPO.load(str(best_zip))
+
+    rows = []
+    # Sweep total *base* bps from 0 to 10 (inclusive)
+    for base_bps in range(0, 11):
+        # Build EnvConfig: enable cost model with fee+slippage=0 and spread fixed at base_bps
+        env_cfg = EnvConfig(
+            cost_enabled=True,
+            fee_bps=0.0,
+            slippage_bps=0.0,
+            spread_type="fixed",
+            spread_fixed_bps=float(base_bps),
+            # spread_type="vol20", # uncomment to show how spread widens with volatility
+            # spread_k_vol_to_bps=base_bps * 100.0,  # scale k with base_bps
+            # spread_vol_col_suffix=cfg.cost_model.spread.vol_col_suffix if hasattr(cfg, "cost_model") else "_s20",
+            include_cash=cfg.env.include_cash,
+            cash_rate_annual=getattr(cfg.env, "cash_rate_annual", 0.0),
+            seed=cfg.seed + base_bps,
+        )
+
+        print(f"[env] P_te {P_te.shape}, X_tez {X_tez.shape}, equal index? {P_te.index.equals(X_tez.index)}")
+        env = DummyVecEnv([_make_env(P_te, X_tez, env_cfg, seed=cfg.seed + 100 + base_bps)])
+        rets, weights = _rollout(best, env)
+        m = _metrics(rets, weights)
+        rows.append({
+            "base_bps": base_bps,
+            "sharpe": m["sharpe"],
+            "max_drawdown": m["max_drawdown"],
+            "turnover": m["turnover"],
+            "num_steps": len(rets),
+        })
+        print(f"[sweep] bps={base_bps:2d}  Sharpe={m['sharpe']:.3f}  MDD={m['max_drawdown']:.1%}  Turnover={m['turnover']:.3f}")
+
+    df = pd.DataFrame(rows).sort_values("base_bps")
+    out_csv = Path(args.out_csv)
+    df.to_csv(out_csv, index=False)
+    print(f"[sweep] wrote {out_csv.resolve()}")
+
+if __name__ == "__main__":
+    main()
