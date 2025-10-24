@@ -1,0 +1,8 @@
+
+__pycache__/
+*.py[cod]
+artifacts/
+models/
+*.np[yz]
+*.zip
+reports/*.png
