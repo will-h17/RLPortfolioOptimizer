@@ -8,7 +8,7 @@ Reward : log(1 + portfolio_return_{t->t+1}) - transaction_cost * L1(turnover)
 
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Optional, Dict, Any
+from typing import Optional, Dict, Any, cast
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -107,8 +107,10 @@ class PortfolioEnv(gym.Env):
         self.t_index = self.prices.index.to_numpy()
 
         # Episode bounds
-        self._start = 0 if getattr(self.cfg, "start", None) is None else int(self.cfg.start)
-        self._end = len(self.t_index) - 1 if getattr(self.cfg, "end", None) is None else int(self.cfg.end)
+        start_val = getattr(self.cfg, "start", None)
+        end_val = getattr(self.cfg, "end", None)
+        self._start = 0 if start_val is None else int(cast(int, start_val))
+        self._end = len(self.t_index) - 1 if end_val is None else int(cast(int, end_val))
         self._start = max(0, min(self._start, self._end - 1))
         self._end = max(self._start + 1, min(self._end, len(self.t_index) - 1))
 
@@ -125,8 +127,8 @@ class PortfolioEnv(gym.Env):
         if not isinstance(prices.index, pd.DatetimeIndex):
             raise ValueError("prices index must be DatetimeIndex.")
 
-        # Align on dates
-        idx = prices.index.intersection(features.index)
+        # Align on dates (cast to DatetimeIndex to satisfy type-checkers)
+        idx = pd.DatetimeIndex(prices.index).intersection(pd.DatetimeIndex(features.index))
         if idx.empty:
             raise ValueError("prices and features have disjoint indices.")
         self.prices = prices.loc[idx].copy()
@@ -161,8 +163,8 @@ class PortfolioEnv(gym.Env):
             raise ValueError(f"Invalid (start,end)=({self._start},{self._end}) for T={T}")
 
         obs_dim = self.features.shape[1] + self.n_assets
-        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
-        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(self.n_assets,), dtype=np.float32)
+        self.observation_space = cast(Any, spaces).Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = cast(Any, spaces).Box(low=0.0, high=1.0, shape=(self.n_assets,), dtype=np.float32)
 
         self._t = 0
         self._w = np.ones(self.n_assets) / self.n_assets

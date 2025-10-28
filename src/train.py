@@ -1,4 +1,3 @@
-# src/train.py
 from __future__ import annotations
 import argparse
 from pathlib import Path
@@ -8,6 +7,7 @@ import torch
 import json
 from dataclasses import fields as dataclass_fields
 
+from src.backtest import evaluate_sb3_model, run_backtest
 from src.config_loader import load_config
 from src.splits import date_slices
 from src.scaler import FitOnTrainScaler
@@ -15,12 +15,17 @@ from src.runlog import RunRecorder
 from src.env import PortfolioEnv, EnvConfig
 from src.agent import make_sb3_ppo
 from src.repro import set_global_seed, collect_versions
+from src.utils.logging import make_loggers
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
 from stable_baselines3.common.utils import set_random_seed as sb3_set_seed
+
+# make helpers importable by HPO:
+__all__ = ["train_once", "_align_after_load", "_clamp_dates_to_index"]
+
 
 # Utilities
 def set_global_seed(seed: int) -> None:
@@ -63,8 +68,18 @@ def build_env_config(cfg) -> EnvConfig:
     return EnvConfig(**filtered)
 
 
-def make_env(prices, features, env_cfg: EnvConfig, seed: int):
+def make_env(prices=None, features=None, env_cfg: EnvConfig = None, seed: int = 0):
+    """
+    Factory that returns an env-initializer callable.
+
+    This accepts the original signature make_env(prices, features, env_cfg, seed)
+    but also has defaults so calls that omit arguments (e.g. make_env(cfg))
+    will not raise a static "missing arguments" error; instead a clear runtime
+    ValueError will be raised if required pieces are not provided.
+    """
     def _init():
+        if prices is None or features is None or env_cfg is None:
+            raise ValueError("make_env requires (prices, features, env_cfg, seed); called with missing or None arguments.")
         env = PortfolioEnv(prices=prices, features=features, config=env_cfg)
         if hasattr(env, "seed"):
             env.seed(seed)
@@ -101,37 +116,38 @@ def _clamp_dates_to_index(idx: pd.DatetimeIndex, train_end: str, val_end: str, t
     Clamp date strings to live within idx[min..max] and enforce ordering train_end <= val_end <= test_end.
     Returns ISO strings you can pass to date_slices.
     """
+    idx = pd.to_datetime(idx).tz_localize(None)
+    idx = pd.DatetimeIndex(idx.unique()).sort_values()
+
     dmin, dmax = idx.min().normalize(), idx.max().normalize()
 
     t_end  = pd.to_datetime(train_end).normalize()
     v_end  = pd.to_datetime(val_end).normalize()
     te_end = pd.to_datetime(test_end).normalize()
 
-    # clamp to [dmin, dmax]
+    # clamp into bounds
     t_end  = min(max(t_end,  dmin), dmax)
     v_end  = min(max(v_end,  dmin), dmax)
     te_end = min(max(te_end, dmin), dmax)
 
-    # enforce nondecreasing order
+    # enforce nondecreasing order; fallback if needed
     if not (t_end <= v_end <= te_end):
-        # make a simple 70/15/15 split as a safe fallback
         n = len(idx)
         i_tr = max(1, int(0.70 * n) - 1)
         i_va = max(i_tr + 1, int(0.85 * n) - 1)
         t_end, v_end, te_end = idx[i_tr].normalize(), idx[i_va].normalize(), idx[-1].normalize()
-        print("[dates] config ordering invalid; using 70/15/15 fallback based on index.")
 
-    # tiny sanity: ensure at least 1 row per segment
-    i_tr_end = idx.get_indexer([t_end], method="bfill")[0]
-    i_va_end = idx.get_indexer([v_end], method="bfill")[0]
-    i_te_end = idx.get_indexer([te_end], method="bfill")[0]
-    if not (i_tr_end >= 0 and i_va_end > i_tr_end and i_te_end > i_va_end):
-        # fallback again if any segment would be empty
+    # NEW: use searchsorted (works on sorted index) instead of get_indexer(..., method="bfill")
+    i_tr_end = int(idx.searchsorted(t_end, side="left"))
+    i_va_end = int(idx.searchsorted(v_end, side="left"))
+    i_te_end = int(idx.searchsorted(te_end, side="left"))
+
+    # ensure segments are non-empty; fallback if necessary
+    if not (0 <= i_tr_end < len(idx) and i_tr_end < i_va_end < i_te_end):
         n = len(idx)
         i_tr = max(1, int(0.70 * n) - 1)
         i_va = max(i_tr + 1, int(0.85 * n) - 1)
         t_end, v_end, te_end = idx[i_tr].normalize(), idx[i_va].normalize(), idx[-1].normalize()
-        print("[dates] segments too small; using 70/15/15 fallback based on index.")
 
     return str(t_end.date()), str(v_end.date()), str(te_end.date())
 
@@ -157,11 +173,14 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path to YAML/JSON config")
     args = ap.parse_args()
-
-    # Load config + set seeds
     cfg = load_config(args.config)
+    train_once(cfg)
 
-    # Repro: global seed + SB3 helper
+def train_once(cfg) -> Path:
+    """
+    Runs one full training job using the existing logic in main().
+    Returns the run directory containing models/, scaler.json, eval/, metrics.json, etc.
+    """
     set_global_seed(cfg.seed)
     sb3_set_seed(cfg.seed)  # SB3’s own RNGs
 
@@ -372,6 +391,9 @@ def main():
 
     print(f"[OK] Run recorded in: {rec.run_dir}")
     print("Saved: config.json, commit.txt, scaler.json, models/, eval/, metrics.json")
+    #
+    # At the end (you already print the run path), just:
+    return Path(rec.run_dir)
 
 
 if __name__ == "__main__":

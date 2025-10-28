@@ -7,8 +7,8 @@ paths:
   out_root: "artifacts"          # all run folders will live under here
 
 dates:
-  train_end: "2020-10-30"
-  val_end:   "2020-12-31"
+  train_end: "2019-12-31"
+  val_end:   "2020-06-30"
   test_end:  "2021-03-31"
 
 env:
@@ -29,11 +29,14 @@ ppo:
   n_steps: 2048
   batch_size: 256
   clip_range: 0.2
-  ent_coef: 0.0
+  ent_coef: 0.0001
   policy_hidden_sizes: [128, 128]
 
+hpo:
+  train_timesteps: 300000
+
 train:
-  total_timesteps: 200000
+  total_timesteps: 500000
   checkpoint_freq: 50000
   eval_freq: 20000
 

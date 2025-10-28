@@ -141,11 +141,29 @@ def evaluate_sb3_model(prices: pd.DataFrame, features: pd.DataFrame, model_path:
     weights = []
     state, _ = env.reset()
     done = False
+
+    # keep a running portfolio value in case env.info doesn't include "value"
+    value = 1.0
     while not done:
         action, _ = model.predict(state, deterministic=True)
         state, reward, done, trunc, info = env.step(action)
-        weights.append(info["weights"])
-        equity.append(info["value"])
+
+        weights.append(info.get("weights"))
+
+        # prefer explicit info["value"], else use info["ret"], else fall back to reward
+        if info is not None and "value" in info and info["value"] is not None:
+            value = float(info["value"])
+        elif info is not None and "ret" in info and info["ret"] is not None:
+            value = value * (1.0 + float(info["ret"]))
+        else:
+            # best-effort fallback: treat reward as an arithmetic return
+            try:
+                value = value * (1.0 + float(reward))
+            except Exception:
+                # if even that fails, keep last value (avoids crash)
+                value = value
+
+        equity.append(value)
 
     equity = np.array(equity[1:])
     weights = np.array(weights)

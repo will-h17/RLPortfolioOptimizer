@@ -30,21 +30,53 @@ class FitOnTrainScaler:
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
+
+        # Ensure scaler was fitted
+        if getattr(self, "mu_", None) is None or getattr(self, "sigma_", None) is None:
+            raise RuntimeError("Scaler not fitted. Call fit(X_train) before save().")
+
+        # JSON keys must be strings; MultiIndex / tuple keys are converted to strings here.
+        mu_dict_raw = self.mu_.to_dict()
+        sigma_dict_raw = self.sigma_.to_dict()
+        mu_dict = {str(k): float(v) for k, v in mu_dict_raw.items()}
+        sigma_dict = {str(k): float(v) for k, v in sigma_dict_raw.items()}
+
         payload = {
-            "mu": self.mu_.to_dict() if isinstance(self.mu_.index, pd.Index) else dict(self.mu_),
-            "sigma": self.sigma_.to_dict() if isinstance(self.sigma_.index, pd.Index) else dict(self.sigma_),
+            "mu": mu_dict,
+            "sigma": sigma_dict,
             "columns": list(map(str, self.mu_.index)),
             "multiindex": isinstance(self.mu_.index, pd.MultiIndex),
         }
         path.write_text(json.dumps(payload))
 
+    
+
     @classmethod
-    def load(cls, path: str | Path, columns) -> "FitOnTrainScaler":
+    def load(cls, path: str | Path, columns=None) -> "FitOnTrainScaler":
         path = Path(path)
         payload = json.loads(path.read_text())
+
+        mu_dict = payload.get("mu", {})
+        sigma_dict = payload.get("sigma", {})
+        saved_columns = payload.get("columns", [])
+        multiindex = payload.get("multiindex", False)
+
+        # Prefer caller-provided columns, otherwise use saved columns
+        cols = columns if columns is not None else saved_columns
+
+        # Rebuild index (if MultiIndex, parse tuple-like strings back to tuples)
+        if multiindex:
+            import ast
+            parsed_cols = [ast.literal_eval(c) if isinstance(c, str) else c for c in cols]
+            index = pd.MultiIndex.from_tuples(parsed_cols)
+        else:
+            index = pd.Index(cols)
+
+        # Recreate Series aligned to the reconstructed index; saved keys are stringified
+        mu = pd.Series([float(mu_dict.get(str(c), 0.0)) for c in cols], index=index)
+        sigma = pd.Series([float(sigma_dict.get(str(c), 1.0)) for c in cols], index=index)
+
         scaler = cls()
-        # rebuild index (MultiIndex or simple Index) from provided columns at runtime
-        idx = columns
-        scaler.mu_ = pd.Series(payload["mu"]).reindex(idx)
-        scaler.sigma_ = pd.Series(payload["sigma"]).reindex(idx).replace(0.0, 1.0)
+        scaler.mu_ = mu
+        scaler.sigma_ = sigma
         return scaler
