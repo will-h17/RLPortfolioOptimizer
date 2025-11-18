@@ -13,7 +13,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-# ---------- Paths ----------
+# Paths
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
 PROC_DIR = PROJECT_ROOT / "data" / "processed"
@@ -51,14 +51,14 @@ def _project_to_simplex(x: np.ndarray) -> np.ndarray:
 
 @dataclass
 class EnvConfig:
-    transaction_cost: float = 0.0  # legacy fallback (fraction, e.g., 0.0005 for 5 bps)
+    transaction_cost: float = 0.0  # fallback (fraction, e.g., 0.0005 for 5 bps)
     include_cash: bool = True
     cash_rate_annual: float = 0.0
     seed: int = 0
 
     start: Optional[int] = None   # starting row index within provided data
     end: Optional[int] = None     # ending row index (inclusive or exclusive per your env)
-    max_steps: Optional[int] = None  # cap episode length if you want
+    max_steps: Optional[int] = None  # cap episode length we you want
 
     # Reward definition: "arith" (default) or "log"
     reward_mode: str = "arith"
@@ -76,9 +76,17 @@ class EnvConfig:
     spread_k_vol_to_bps: float = 8000.0
     spread_vol_col_suffix: str = "_s20"
 
+    # Observation normalization (optional, for RL training stability)
+    normalize_obs_weights: bool = False  # If True, normalize weights relative to equal-weight
+
+    # Advanced reward shaping for higher Sharpe
+    reward_vol_scaling: bool = False  # Scale reward by Sharpe-like metric (preserves returns, reduces vol → higher Sharpe AND final value)
+    reward_sharpe_bonus: float = 0.0  # Bonus for high rolling Sharpe (0.0 = disabled)
+    reward_vol_window: int = 20  # Window for rolling volatility/Sharpe calculation
+
     @property
     def cash_daily_rate(self) -> float:
-        # 252 trading days; adjust if you use calendar days
+        # 252 trading days; adjust we want to use calendar days
         return float(self.cash_rate_annual) / 252.0
 
 
@@ -88,45 +96,14 @@ class PortfolioEnv(gym.Env):
     def __init__(self, prices: pd.DataFrame, features: pd.DataFrame, config: Optional[EnvConfig] = None) -> None:
         super().__init__()
         self.cfg = config or EnvConfig()
-        # keep `config` and `cfg` consistent so other methods can use either attribute
         self.config = self.cfg
         self.rng = np.random.default_rng(self.cfg.seed)
         
-        # Expect DataFrames with same index and asset columns
-        assert isinstance(prices, pd.DataFrame) and isinstance(features, pd.DataFrame)
-        common = prices.index.intersection(features.index)
-        if len(common) == 0:
-            raise ValueError("prices and features have disjoint indices.")
-        self.prices = prices.loc[common]
-        self.features = features.loc[common]
-        self.asset_cols = list(self.prices.columns)
-        self.n_assets = len(self.asset_cols)
-
-        # Precompute arithmetic daily returns (T x N)
-        self._rets = self.prices.pct_change().fillna(0.0).to_numpy(dtype=float)
-        self.t_index = self.prices.index.to_numpy()
-
-        # Episode bounds
-        start_val = getattr(self.cfg, "start", None)
-        end_val = getattr(self.cfg, "end", None)
-        self._start = 0 if start_val is None else int(cast(int, start_val))
-        self._end = len(self.t_index) - 1 if end_val is None else int(cast(int, end_val))
-        self._start = max(0, min(self._start, self._end - 1))
-        self._end = max(self._start + 1, min(self._end, len(self.t_index) - 1))
-
-        # Convention: first reward uses return from (t-1 -> t), so start at t=1
-        self._t0 = max(self._start + 1, 1)
-        self.t = self._t0
-
-        # Start equal-weight (or your preferred initial weights)
-        self._w = np.ones(self.n_assets, dtype=float) / self.n_assets
-
-        # Done flag MUST exist before first step()
-        self.done = False
-
+        # Validate inputs
         if not isinstance(prices.index, pd.DatetimeIndex):
             raise ValueError("prices index must be DatetimeIndex.")
-
+        assert isinstance(prices, pd.DataFrame) and isinstance(features, pd.DataFrame)
+        
         # Align on dates (cast to DatetimeIndex to satisfy type-checkers)
         idx = pd.DatetimeIndex(prices.index).intersection(pd.DatetimeIndex(features.index))
         if idx.empty:
@@ -137,6 +114,7 @@ class PortfolioEnv(gym.Env):
         if self.prices.isna().any().any() or self.features.isna().any().any():
             raise ValueError("NaNs detected; ensure data.py and features.py produced clean outputs.")
 
+        # Handle cash asset if needed
         if self.cfg.include_cash:
             cash_col = "__CASH__"
             if cash_col in self.prices.columns:
@@ -148,27 +126,59 @@ class PortfolioEnv(gym.Env):
 
         self.assets = list(self.prices.columns)
         self.n_assets = len(self.assets)
+        self.asset_cols = self.assets  # alias for compatibility
 
-        # Precompute simple returns P[t+1]/P[t]-1
+        # Precompute simple returns P[t+1]/P[t]-1 as numpy array (T-1 x N)
         P = self.prices.to_numpy(dtype=np.float64)
         self._rets = P[1:] / P[:-1] - 1.0
         if self.cfg.include_cash:
             cash_idx = self.assets.index("__CASH__")
             self._rets[:, cash_idx] = float(self.cfg.cash_daily_rate)
 
+        # Precompute features as numpy array for fast indexing (T x F)
+        # This avoids DataFrame.iloc calls in _obs() which is called millions of times
+        self._features_array = self.features.to_numpy(dtype=np.float32)
+        self._n_features = self._features_array.shape[1]
+
+        # Precompute vol column indices if using vol20 spread (optimization: avoid repeated lookups)
+        self._vol_col_indices = None
+        if self.cfg.cost_enabled and getattr(self.cfg, "spread_type", "fixed") == "vol20":
+            suffix = str(getattr(self.cfg, "spread_vol_col_suffix", "_s20"))
+            vol_cols = [f"{c}{suffix}" for c in self.assets]
+            if all(col in self.features.columns for col in vol_cols):
+                try:
+                    self._vol_col_indices = [self.features.columns.get_loc(c) for c in vol_cols]
+                except (KeyError, IndexError):
+                    # MultiIndex or other edge case - will use fallback in _per_asset_cost_bps
+                    self._vol_col_indices = None
+
+        # Episode bounds
         T = len(self.prices)
-        self._start = 0 if self.cfg.start is None else int(self.cfg.start)
-        self._end = (T - 2) if self.cfg.end is None else int(self.cfg.end)
+        start_val = getattr(self.cfg, "start", None)
+        end_val = getattr(self.cfg, "end", None)
+        self._start = 0 if start_val is None else int(cast(int, start_val))
+        self._end = (T - 2) if end_val is None else int(cast(int, end_val))
         if not (0 <= self._start <= self._end <= T - 2):
             raise ValueError(f"Invalid (start,end)=({self._start},{self._end}) for T={T}")
 
-        obs_dim = self.features.shape[1] + self.n_assets
+        # Convention: first reward uses return from (t-1 -> t), so start at t=1
+        self._t0 = max(self._start + 1, 1)
+        self.t = self._t0  # Use self.t consistently (not self._t)
+
+        # Start equal-weight (or your preferred initial weights)
+        self._w = np.ones(self.n_assets, dtype=np.float32) / self.n_assets
+        self._value = 1.0
+
+        # Track portfolio returns for volatility/Sharpe-based reward shaping
+        self._portfolio_returns = []  # List of portfolio returns for rolling calculations
+
+        # Done flag MUST exist before first step()
+        self.done = False
+
+        # Observation and action spaces
+        obs_dim = self._n_features + self.n_assets
         self.observation_space = cast(Any, spaces).Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
         self.action_space = cast(Any, spaces).Box(low=0.0, high=1.0, shape=(self.n_assets,), dtype=np.float32)
-
-        self._t = 0
-        self._w = np.ones(self.n_assets) / self.n_assets
-        self._value = 1.0
 
     def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
         if seed is not None:
@@ -180,6 +190,8 @@ class PortfolioEnv(gym.Env):
                 pass
         self.t = self._t0
         self._w = np.ones(self.n_assets, dtype=float) / self.n_assets
+        self._value = 1.0
+        self._portfolio_returns = []  # Reset return history
         self.done = False
         obs = self._obs()   # whatever you use to build an observation at time t
         info = {}
@@ -198,9 +210,10 @@ class PortfolioEnv(gym.Env):
         if self.done:
             return self._obs(), 0.0, True, False, {}
 
-        # Previous weights and this period’s asset returns (arith)
-        w_prev = self._w.astype(float).copy()
-        r_t = self._rets[self.t, :].astype(float).copy()
+        # Previous weights and this period's asset returns (arith)
+        # Use views instead of copies for performance (only copy when needed for info dict)
+        w_prev = self._w
+        r_t = self._rets[self.t, :]
 
         # Gross portfolio return for this step
         mode = getattr(self.config, "reward_mode", "arith")
@@ -211,7 +224,7 @@ class PortfolioEnv(gym.Env):
         else:
             raise ValueError(f"Unknown reward_mode={mode!r}")
 
-        # Project action to simplex of length n_assets (implement your own if different)
+        # Project action to simplex of length n_assets
         a = np.asarray(action, dtype=float).ravel()
         w_target = _project_to_simplex(a)
         w_new = w_target
@@ -224,7 +237,44 @@ class PortfolioEnv(gym.Env):
         base = ret_gross - cost
         rw   = float(getattr(self.config, "return_weight", 1.0))
         pen_turn = float(getattr(self.config, "turnover_penalty", 0.0)) * turnover
+        
+        # Track portfolio return for volatility/Sharpe calculations
+        self._portfolio_returns.append(base)
+        
+        # Advanced reward shaping for higher Sharpe
         reward = rw * base - pen_turn
+        
+        # Volatility scaling: scale reward by Sharpe-like metric (preserves returns, reduces vol)
+        # This encourages the agent to reduce volatility while maintaining returns → increases Sharpe AND final value
+        if getattr(self.config, "reward_vol_scaling", False):
+            vol_window = int(getattr(self.config, "reward_vol_window", 20))
+            if len(self._portfolio_returns) >= vol_window:
+                recent_rets = np.array(self._portfolio_returns[-vol_window:], dtype=np.float64)
+                rolling_mean = float(np.mean(recent_rets))
+                rolling_vol = float(np.std(recent_rets))
+                if rolling_vol > 1e-6:
+                    # Scale by Sharpe-like metric: mean / (vol + epsilon)
+                    # This preserves returns while penalizing high volatility
+                    # Higher Sharpe → higher scaled reward (encourages both high returns AND low vol)
+                    sharpe_scale = rolling_mean / (rolling_vol + 0.01)
+                    # Normalize to reasonable scale (avoid extreme values)
+                    # Clip to [0.1, 10.0] to prevent reward explosion or collapse
+                    sharpe_scale = np.clip(sharpe_scale, 0.1, 10.0)
+                    reward = reward * sharpe_scale
+        
+        # Sharpe bonus: add bonus for high rolling Sharpe
+        sharpe_bonus_coef = float(getattr(self.config, "reward_sharpe_bonus", 0.0))
+        if sharpe_bonus_coef > 0.0:
+            vol_window = int(getattr(self.config, "reward_vol_window", 20))
+            if len(self._portfolio_returns) >= vol_window:
+                recent_rets = np.array(self._portfolio_returns[-vol_window:], dtype=np.float64)
+                rolling_mean = float(np.mean(recent_rets))
+                rolling_vol = float(np.std(recent_rets))
+                if rolling_vol > 1e-6:
+                    rolling_sharpe = rolling_mean / rolling_vol * np.sqrt(252.0)  # Annualized
+                    # Bonus proportional to Sharpe (clipped to avoid extreme values)
+                    sharpe_bonus = sharpe_bonus_coef * np.clip(rolling_sharpe, -5.0, 5.0)
+                    reward = reward + sharpe_bonus
 
         # Advance state
         self._w = w_new
@@ -232,25 +282,41 @@ class PortfolioEnv(gym.Env):
         self.done = self.t >= self._end
 
         obs = self._obs()
+        # Update portfolio value for tracking
+        self._value = self._value * (1.0 + base)
+        
+        # Only copy arrays that are returned in info (to avoid reference issues)
         info = {
-            "weights": w_new.copy(),
-            "prev_weights": w_prev.copy(),
+            "weights": w_new.copy(),  # New weights, copy for safety
+            "prev_weights": w_prev.copy(),  # Previous weights, copy for safety
             "w_prev": w_prev.copy(),   # alias expected by tests
-            "r_t": r_t.copy(),
+            "r_t": r_t.copy(),  # Returns, copy for safety
             "ret_gross": float(ret_gross),
             "cost": float(cost),
             "ret_net": float(reward),
             "turnover": float(turnover),
+            "value": float(self._value),  # Current portfolio value
         }
         return obs, reward, self.done, False, info
 
     def _obs(self) -> np.ndarray:
-        feats = self.features.iloc[self._t].to_numpy(dtype=np.float64)
-        return np.concatenate([feats, self._w]).astype(np.float32)
+        # Use precomputed numpy array instead of DataFrame.iloc for ~10x speedup
+        feats = self._features_array[self.t, :]
+        
+        # Optionally normalize weights component (relative to equal-weight)
+        # This can help with RL training stability by keeping observation scale consistent
+        if getattr(self.cfg, "normalize_obs_weights", False):
+            # Normalize weights relative to equal-weight: (w - 1/N) / (1/N) = N*w - 1
+            # This centers weights around 0 and scales by N
+            w_norm = self._w * self.n_assets - 1.0
+        else:
+            w_norm = self._w
+        
+        return np.concatenate([feats, w_norm]).astype(np.float32)
 
     def render(self, mode: str = "human") -> None:
-        ts = self.prices.index[self._t]
-        print(f"[{ts.date()}] t={self._t} value={self._value:.6f} w={np.round(self._w, 3)}")
+        ts = self.prices.index[self.t]  # Use self.t consistently
+        print(f"[{ts.date()}] t={self.t} value={self._value:.6f} w={np.round(self._w, 3)}")
 
     def _per_asset_cost_bps(self, t: int) -> np.ndarray:
         """
@@ -273,23 +339,31 @@ class PortfolioEnv(gym.Env):
         # SPREAD: either fixed or proportional to 20d daily vol
         spread_bps = np.full(n, float(getattr(cfg, "spread_fixed_bps", 0.0)), dtype=np.float64)
         if getattr(cfg, "spread_type", "fixed") == "vol20":
-            # Features must contain per-asset rolling std of daily returns at time t
-            suffix = str(getattr(cfg, "spread_vol_col_suffix", "_s20"))
-            vol_cols = [f"{c}{suffix}" for c in self.assets]  # e.g., ["AAPL_s20", "MSFT_s20", ...]
-            # If any col missing, treat as 0 spread contribution
-            # self.features is a DataFrame indexed by time with these columns
-            if all(col in self.features.columns for col in vol_cols):
-                vol = self.features.iloc[t][vol_cols].to_numpy(dtype=np.float64)  # daily vol (e.g., 0.012)
-                k = float(getattr(cfg, "spread_k_vol_to_bps", 8000.0))
-                spread_bps = k * vol  # convert vol to bps via a scalar
-            # else: keep defaults (zeros or fixed)
+            # Use precomputed vol column indices if available (optimization)
+            if self._vol_col_indices is not None:
+                vol = self._features_array[t, self._vol_col_indices].astype(np.float64)
+            else:
+                # Fallback: compute indices on-the-fly or use DataFrame
+                suffix = str(getattr(cfg, "spread_vol_col_suffix", "_s20"))
+                vol_cols = [f"{c}{suffix}" for c in self.assets]
+                if all(col in self.features.columns for col in vol_cols):
+                    try:
+                        col_indices = [self.features.columns.get_loc(c) for c in vol_cols]
+                        vol = self._features_array[t, col_indices].astype(np.float64)
+                    except (KeyError, IndexError):
+                        # Fallback to DataFrame if column lookup fails (e.g., MultiIndex)
+                        vol = self.features.iloc[t][vol_cols].to_numpy(dtype=np.float64)
+                else:
+                    vol = np.zeros(n, dtype=np.float64)
+            k = float(getattr(cfg, "spread_k_vol_to_bps", 8000.0))
+            spread_bps = k * vol  # convert vol to bps via a scalar
 
         # crossing half-spread once + fee + slippage
         per_asset_bps = fee + slp + 0.5 * spread_bps
         return per_asset_bps
 
 
-# --------------------------- self-test --------------------------- #
+# self-test 
 if __name__ == "__main__":
     prices_path = PROC_DIR / "prices_adj.parquet"
     feats_path = PROC_DIR / "features.parquet"

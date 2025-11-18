@@ -4,14 +4,13 @@ from typing import Optional, Tuple, Dict, List
 import numpy as np
 import pandas as pd
 
-# -------------------------------
+
 # Cost model (fee + slippage + 1/2 spread)
-# -------------------------------
 
 @dataclass
 class CostCfg:
     enabled: bool = False
-    # legacy flat cost (fraction, e.g. 0.0005 for 5 bps) used only when enabled=False
+    # flat cost (fraction, e.g. 0.0005 for 5 bps) used only when enabled=False
     flat_fraction: float = 0.0
 
     # component bps when enabled=True
@@ -55,9 +54,7 @@ def _per_asset_cost_bps(
     return fee + slp + 0.5 * spread_bps
 
 
-# -------------------------------
 # Metrics helpers
-# -------------------------------
 
 def _sharpe_daily(rets: np.ndarray) -> float:
     if len(rets) < 2:
@@ -80,9 +77,7 @@ def _avg_turnover(weights_seq: List[np.ndarray]) -> float:
     return float(per_step.mean())
 
 
-# -------------------------------
 # Rebalancing / engine utilities
-# -------------------------------
 
 def _price_to_returns(prices: pd.DataFrame) -> pd.DataFrame:
     return prices.pct_change().fillna(0.0)
@@ -115,13 +110,17 @@ def _run_backtest(
     R = _price_to_returns(prices).to_numpy(dtype=np.float64)
     dates = prices.index
 
-    # start flat; first target will trade into position (cost applies)
-    w = np.zeros(len(assets), dtype=np.float64)
-    w_hist, rets = [], []
-
     # forward-fill target weights to daily grid
     T = len(dates)
     TW = target_weights.reindex(dates).ffill().fillna(0.0).to_numpy(dtype=np.float64)
+
+    # Preallocate arrays for better memory efficiency (optimization)
+    n_assets = len(assets)
+    rets = np.empty(T, dtype=np.float64)
+    w_hist = np.empty((T, n_assets), dtype=np.float64)
+
+    # start flat; first target will trade into position (cost applies)
+    w = np.zeros(n_assets, dtype=np.float64)
 
     for t in range(T):
         # portfolio return using *previous* weights
@@ -141,30 +140,27 @@ def _run_backtest(
             w = w_target
 
         port_ret_net = port_ret_gross - cost
-        rets.append(port_ret_net)
-        w_hist.append(w.copy())
+        rets[t] = port_ret_net
+        w_hist[t, :] = w
 
-    rets = np.asarray(rets, dtype=np.float64)
     equity = (1.0 + rets).cumprod()
     metrics = {
         "sharpe": _sharpe_daily(rets),
         "max_drawdown": _max_drawdown(equity),
-        "turnover": _avg_turnover(w_hist),
+        "turnover": _avg_turnover([w_hist[i, :] for i in range(T)]),  # Convert to list of arrays for _avg_turnover
         "num_steps": int(len(rets)),
     }
     return {
         "metrics": metrics,
         "equity": equity,
-        "weights": np.vstack(w_hist) if w_hist else np.zeros((0, len(assets))),
+        "weights": w_hist,  # Already a numpy array, no need to vstack
         "dates": dates,
         "assets": assets,
         "returns": rets,
     }
 
 
-# -------------------------------
 # Baseline 1: Vol-targeted Equal-Weight
-# -------------------------------
 
 def vt_equal_weight(
     prices: pd.DataFrame,
@@ -205,9 +201,7 @@ def vt_equal_weight(
     return pd.DataFrame(rows)
 
 
-# -------------------------------
 # Baseline 2: Inverse-Variance Portfolio (IVP)
-# -------------------------------
 
 def ivp_inverse_variance(
     prices: pd.DataFrame,
@@ -229,9 +223,7 @@ def ivp_inverse_variance(
     return pd.DataFrame(rows)
 
 
-# -------------------------------
 # Baseline 3: Naive Cross-Sectional Momentum (12-1 style)
-# -------------------------------
 
 def momentum_xs(
     prices: pd.DataFrame,

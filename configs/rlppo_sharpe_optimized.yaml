@@ -1,0 +1,54 @@
+run_name: "ppo_sharpe_optimized"
+
+seed: 42
+paths:
+  prices: "data/processed/prices_adj.parquet"
+  features: "data/processed/features.parquet"
+  out_root: "artifacts"
+
+dates:
+  train_end: "2019-12-31"
+  val_end: "2020-06-30"
+  test_end: "2021-03-31"
+
+env:
+  transaction_cost_bps: 0
+  include_cash: true
+  cash_rate_annual: 0.02
+  normalize_obs_weights: true
+  # Advanced reward shaping for higher Sharpe
+  reward_vol_scaling: true          # Scale reward by inverse volatility
+  reward_sharpe_bonus: 0.02         # Small bonus for high rolling Sharpe
+  reward_vol_window: 20             # 20-day rolling window
+
+reward:
+  return_weight: 1.0
+  turnover_penalty: 0.0005           # From your HPO results
+  drawdown_penalty: 0.0
+  volatility_penalty: 0.0
+
+ppo:
+  learning_rate: 4.316157612041365e-05  # From your HPO
+  gamma: 0.9664577204636909
+  gae_lambda: 0.9011627554440242
+  n_steps: 4096
+  batch_size: 512
+  clip_range: 0.29481917059030266
+  ent_coef: 0.007649040082742959
+  policy_hidden_sizes: [256, 256, 128]
+
+train:
+  total_timesteps: 5000000           # 5m steps (more training)
+  checkpoint_freq: 100000
+  eval_freq: 50000
+
+cost_model:
+  enabled: true
+  fee_bps: 0.0
+  slippage_bps: 0.0
+  spread:
+    type: "vol20"
+    fixed_bps: 2.0
+    k_vol_to_bps: 4000.0
+    vol_col_suffix: "_s20"
+

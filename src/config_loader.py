@@ -1,3 +1,21 @@
+"""
+config_loader.py — Configuration file loader.
+
+This module provides dataclass-based configuration management for the training pipeline.
+It loads YAML or JSON configuration files and converts them into structured dataclass
+objects with type safety and default values.
+
+Components:
+- PathsCfg: Data file paths (prices, features, output directory)
+- DatesCfg: Train/validation/test date splits
+- EnvCfg: Environment settings (transaction costs, cash, reward shaping)
+- RewardCfg: Reward function parameters (penalties, weights)
+- PPOCfg: PPO algorithm hyperparameters
+- TrainCfg: Training schedule (timesteps, checkpoint frequency)
+- CostModelCfg: Transaction cost model configuration
+- AppCfg: Top-level configuration combining all sections
+"""
+
 from __future__ import annotations
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -22,6 +40,11 @@ class EnvCfg:
     transaction_cost_bps: float = 0.0
     include_cash: bool = True
     cash_rate_annual: float = 0.0
+    normalize_obs_weights: bool = False
+    # Advanced reward shaping for higher Sharpe
+    reward_vol_scaling: bool = False
+    reward_sharpe_bonus: float = 0.0
+    reward_vol_window: int = 20
 
 @dataclass
 class RewardCfg:
@@ -48,6 +71,18 @@ class TrainCfg:
     eval_freq: int = 20_000
 
 @dataclass
+class CostModelCfg:
+    enabled: bool = False
+    fee_bps: float = 0.0
+    slippage_bps: float = 0.0
+    spread: Dict[str, Any] = field(default_factory=lambda: {
+        "type": "fixed",
+        "fixed_bps": 0.0,
+        "k_vol_to_bps": 8000.0,
+        "vol_col_suffix": "_s20"
+    })
+
+@dataclass
 class AppCfg:
     run_name: str
     seed: int
@@ -57,6 +92,7 @@ class AppCfg:
     reward: RewardCfg
     ppo: PPOCfg
     train: TrainCfg
+    cost_model: CostModelCfg = field(default_factory=CostModelCfg)
 
 def _load_raw(path: str | Path) -> Dict[str, Any]:
     p = Path(path)
@@ -76,4 +112,5 @@ def load_config(path: str | Path) -> AppCfg:
         reward   = RewardCfg(**raw.get("reward", {})),
         ppo      = PPOCfg(**raw.get("ppo", {})),
         train    = TrainCfg(**raw.get("train", {})),
+        cost_model = CostModelCfg(**raw.get("cost_model", {})),
     )
