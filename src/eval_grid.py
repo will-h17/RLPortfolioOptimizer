@@ -9,7 +9,7 @@ import pandas as pd
 
 from src.scaler import FitOnTrainScaler
 from src.repro import set_global_seed
-from src.backtest import evaluate_sb3_model  # uses your PortfolioEnv properly
+from src.backtest import evaluate_sb3_model
 from src.baselines import (
     CostCfg,
     vt_equal_weight,
@@ -21,7 +21,7 @@ from src.baselines import (
 ROOT = Path(__file__).resolve().parent.parent
 PROC = ROOT / "data" / "processed"
 
-# ---------- helpers ----------
+# helpers
 
 def _auto_latest_run(artifacts_root: Path) -> Path:
     runs = sorted(artifacts_root.glob("*__*"), key=os.path.getmtime)
@@ -133,7 +133,7 @@ def _align_with_warmup(prices: pd.DataFrame, feats: pd.DataFrame, min_rows:int=2
     return P2.loc[idx], F2.loc[idx], None
 
 
-# ---------- main grid ----------
+# main grid
 
 def main():
     ap = argparse.ArgumentParser()
@@ -157,6 +157,18 @@ def main():
     # Load data
     prices_all = pd.read_parquet(PROC / "prices_adj.parquet")
     feats_all  = pd.read_parquet(PROC / "features.parquet")
+
+    # Load scaler once before loops (optimization: avoid repeated I/O)
+    scaler = FitOnTrainScaler.load(scaler_path, columns=feats_all.columns)
+    # determine scaler column names with several fallbacks
+    scaler_cols = getattr(scaler, "columns_", None)
+    if scaler_cols is None:
+        scaler_cols = getattr(scaler, "columns", None)
+    if scaler_cols is None:
+        scaler_cols = getattr(scaler, "feature_names_in_", None)
+    if scaler_cols is None:
+        scaler_cols = []
+    scaler_cols = list(scaler_cols)
 
     # Results accumulator
     rows: List[Dict[str, object]] = []
@@ -188,17 +200,7 @@ def main():
                     continue
                 P_s, F_s, _ = res2
 
-                # Load scaler fitted on TRAIN of the run, transform features of this slice
-                scaler = FitOnTrainScaler.load(scaler_path, columns=feats_all.columns)
-                # determine scaler column names with several fallbacks for compatibility
-                scaler_cols = getattr(scaler, "columns_", None)
-                if scaler_cols is None:
-                    scaler_cols = getattr(scaler, "columns", None)
-                if scaler_cols is None:
-                    scaler_cols = getattr(scaler, "feature_names_in_", None)
-                if scaler_cols is None:
-                    scaler_cols = []
-                scaler_cols = list(scaler_cols)
+                # Transform features using pre-loaded scaler (optimization: scaler loaded once above)
                 # keep only selected feature columns for transform (intersection with scaler columns)
                 keep_cols = [c for c in F_s.columns if c in set(scaler_cols)]
                 X_s = F_s[keep_cols]
@@ -209,14 +211,14 @@ def main():
                 P_s = P_s.loc[common]
                 X_sz = X_sz.loc[common]
 
-                # --- RL eval ---
+                # RL eval
                 try:
                     m_rl = _eval_rl(P_s, X_sz, model_zip)
                     rows.append(dict(model="RL", universe=uname, period=pname, ablation=ab_name, **m_rl))
                 except Exception as e:
                     rows.append(dict(model="RL", universe=uname, period=pname, ablation=ab_name, error=f"{type(e).__name__}: {e}"))
 
-                # --- Baselines ---
+                # Baselines
                 base_rows = _eval_baselines(P_s, feats_raw=None, ab_cfg=ab, bl_cfg=grid.get("baselines", {}))
                 for br in base_rows:
                     rows.append(dict(universe=uname, period=pname, ablation=ab_name, **br))

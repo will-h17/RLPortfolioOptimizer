@@ -12,40 +12,22 @@ from src.runlog import RunRecorder
 from src.scaler import FitOnTrainScaler
 from src.env import PortfolioEnv, EnvConfig
 from src.splits import date_slices
+from src.utils.data_utils import align_after_load, clamp_dates_to_index
 
-def _align_after_load(prices: pd.DataFrame, feats: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    # keep only rows where features are fully ready, then intersect indices
-    feats = feats.dropna(how="any")
-    common = prices.index.intersection(feats.index)
-    if len(common) == 0:
-        raise ValueError("No common timestamps after dropping NaNs in features.")
-    prices = prices.loc[common]
-    feats  = feats.loc[common]
-    print(f"[data] usable rows: {len(common)} from {common.min().date()} to {common.max().date()}")
-    return prices, feats
-
-def _clamp_dates_to_index(idx: pd.DatetimeIndex, train_end: str, val_end: str, test_end: str) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]:
-    dmin, dmax = idx.min().normalize(), idx.max().normalize()
-    t_end  = min(max(pd.to_datetime(train_end).normalize(), dmin), dmax)
-    v_end  = min(max(pd.to_datetime(val_end).normalize(),   dmin), dmax)
-    te_end = min(max(pd.to_datetime(test_end).normalize(),  dmin), dmax)
-    if not (t_end <= v_end <= te_end):
-        # simple 70/15/15 fallback
-        n = len(idx)
-        i_tr = max(1, int(0.70 * n) - 1)
-        i_va = max(i_tr + 1, int(0.85 * n) - 1)
-        t_end, v_end, te_end = idx[i_tr].normalize(), idx[i_va].normalize(), idx[-1].normalize()
-        print("[dates] invalid order; using 70/15/15 fallback.")
-    return t_end, v_end, te_end
+# Note: clamp_dates_to_index returns strings, convert to Timestamps if needed
 
 def _load_data(cfg):
     prices = pd.read_parquet(cfg.paths.prices)
     feats  = pd.read_parquet(cfg.paths.features)
 
-    prices, feats = _align_after_load(prices, feats)
+    prices, feats = align_after_load(prices, feats)
 
     # clamp to usable range and do **mask-based** split, same as train.py
-    t_end, v_end, te_end = _clamp_dates_to_index(feats.index, cfg.dates.train_end, cfg.dates.val_end, cfg.dates.test_end)
+    # Shared utility returns strings, convert to Timestamps for comparison
+    t_end_str, v_end_str, te_end_str = clamp_dates_to_index(feats.index, cfg.dates.train_end, cfg.dates.val_end, cfg.dates.test_end)
+    t_end = pd.to_datetime(t_end_str)
+    v_end = pd.to_datetime(v_end_str)
+    te_end = pd.to_datetime(te_end_str)
     print(f"[dates] using train_end={t_end.date()}, val_end={v_end.date()}, test_end={te_end.date()}")
 
     idx = prices.index

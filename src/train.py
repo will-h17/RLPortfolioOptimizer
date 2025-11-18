@@ -15,7 +15,8 @@ from src.runlog import RunRecorder
 from src.env import PortfolioEnv, EnvConfig
 from src.agent import make_sb3_ppo
 from src.repro import set_global_seed, collect_versions
-from src.utils.logging import make_loggers
+from src.utils.data_utils import align_after_load, clamp_dates_to_index
+# from src.utils.logging import make_loggers
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
@@ -53,6 +54,12 @@ def build_env_config(cfg) -> EnvConfig:
         "transaction_cost": tc,
         "include_cash": getattr(cfg.env, "include_cash", True),
         "cash_rate_annual": getattr(cfg.env, "cash_rate_annual", 0.0),
+        "normalize_obs_weights": getattr(cfg.env, "normalize_obs_weights", False),
+        
+        # Advanced reward shaping for higher Sharpe
+        "reward_vol_scaling": getattr(cfg.env, "reward_vol_scaling", False),
+        "reward_sharpe_bonus": getattr(cfg.env, "reward_sharpe_bonus", 0.0),
+        "reward_vol_window": getattr(cfg.env, "reward_vol_window", 20),
 
         # Reward shaping knobs (only used if EnvConfig defines them)
         "return_weight": getattr(cfg.reward, "return_weight", 1.0),
@@ -62,6 +69,20 @@ def build_env_config(cfg) -> EnvConfig:
 
         "seed": cfg.seed,
     }
+
+    # Cost model parameters (if cost_model section exists)
+    cost_model = getattr(cfg, "cost_model", None)
+    if cost_model is not None:
+        spread = getattr(cost_model, "spread", {})
+        candidates.update({
+            "cost_enabled": getattr(cost_model, "enabled", False),
+            "fee_bps": getattr(cost_model, "fee_bps", 0.0),
+            "slippage_bps": getattr(cost_model, "slippage_bps", 0.0),
+            "spread_type": spread.get("type", "fixed") if isinstance(spread, dict) else getattr(spread, "type", "fixed"),
+            "spread_fixed_bps": spread.get("fixed_bps", 0.0) if isinstance(spread, dict) else getattr(spread, "fixed_bps", 0.0),
+            "spread_k_vol_to_bps": spread.get("k_vol_to_bps", 8000.0) if isinstance(spread, dict) else getattr(spread, "k_vol_to_bps", 8000.0),
+            "spread_vol_col_suffix": spread.get("vol_col_suffix", "_s20") if isinstance(spread, dict) else getattr(spread, "vol_col_suffix", "_s20"),
+        })
 
     allowed = {f.name for f in dataclass_fields(EnvConfig)}
     filtered = {k: v for k, v in candidates.items() if k in allowed}
@@ -94,62 +115,7 @@ def make_env(prices=None, features=None, env_cfg: EnvConfig = None, seed: int = 
 
 
 
-def _align_after_load(prices: pd.DataFrame, feats: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """
-    1) Drop rows in features that are not fully ready (NaNs from rolling/shift).
-    2) Intersect indices and return aligned (prices, feats) on the common dates.
-    """
-    feats = feats.dropna(how="any")  # keep only rows where all features exist
-    common = prices.index.intersection(feats.index)
-    if len(common) == 0:
-        raise ValueError(
-            "No common timestamps after dropping NaNs in features. "
-            "Check your warm-up trimming and feature construction."
-        )
-    prices = prices.loc[common]
-    feats  = feats.loc[common]
-    print(f"[data] usable rows: {len(common)} from {common.min().date()} to {common.max().date()}")
-    return prices, feats
 
-def _clamp_dates_to_index(idx: pd.DatetimeIndex, train_end: str, val_end: str, test_end: str) -> tuple[str, str, str]:
-    """
-    Clamp date strings to live within idx[min..max] and enforce ordering train_end <= val_end <= test_end.
-    Returns ISO strings you can pass to date_slices.
-    """
-    idx = pd.to_datetime(idx).tz_localize(None)
-    idx = pd.DatetimeIndex(idx.unique()).sort_values()
-
-    dmin, dmax = idx.min().normalize(), idx.max().normalize()
-
-    t_end  = pd.to_datetime(train_end).normalize()
-    v_end  = pd.to_datetime(val_end).normalize()
-    te_end = pd.to_datetime(test_end).normalize()
-
-    # clamp into bounds
-    t_end  = min(max(t_end,  dmin), dmax)
-    v_end  = min(max(v_end,  dmin), dmax)
-    te_end = min(max(te_end, dmin), dmax)
-
-    # enforce nondecreasing order; fallback if needed
-    if not (t_end <= v_end <= te_end):
-        n = len(idx)
-        i_tr = max(1, int(0.70 * n) - 1)
-        i_va = max(i_tr + 1, int(0.85 * n) - 1)
-        t_end, v_end, te_end = idx[i_tr].normalize(), idx[i_va].normalize(), idx[-1].normalize()
-
-    # NEW: use searchsorted (works on sorted index) instead of get_indexer(..., method="bfill")
-    i_tr_end = int(idx.searchsorted(t_end, side="left"))
-    i_va_end = int(idx.searchsorted(v_end, side="left"))
-    i_te_end = int(idx.searchsorted(te_end, side="left"))
-
-    # ensure segments are non-empty; fallback if necessary
-    if not (0 <= i_tr_end < len(idx) and i_tr_end < i_va_end < i_te_end):
-        n = len(idx)
-        i_tr = max(1, int(0.70 * n) - 1)
-        i_va = max(i_tr + 1, int(0.85 * n) - 1)
-        t_end, v_end, te_end = idx[i_tr].normalize(), idx[i_va].normalize(), idx[-1].normalize()
-
-    return str(t_end.date()), str(v_end.date()), str(te_end.date())
 
 def _align_split(P: pd.DataFrame, X: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     common = P.index.intersection(X.index)
@@ -166,9 +132,7 @@ def _align_split(P: pd.DataFrame, X: pd.DataFrame) -> tuple[pd.DataFrame, pd.Dat
 
 
 
-# --------------------------
 # Main
-# --------------------------
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--config", required=True, help="Path to YAML/JSON config")
@@ -216,10 +180,10 @@ def train_once(cfg) -> Path:
     prices = prices.iloc[WARMUP:].copy()
     feats  = feats.iloc[WARMUP:].copy()
 
-    prices, feats = _align_after_load(prices, feats)
+    prices, feats = align_after_load(prices, feats)
 
-    # --- clamp/validate dates using the *usable* index you just printed ---
-    t_end, v_end, te_end = _clamp_dates_to_index(
+    # clamp/validate dates
+    t_end, v_end, te_end = clamp_dates_to_index(
         pd.DatetimeIndex(feats.index),  # feats/prices share same index now
         cfg.dates.train_end,
         cfg.dates.val_end,
@@ -267,7 +231,7 @@ def train_once(cfg) -> Path:
     # PPO kwargs (SB3) pulled from config — only SB3 parameters here
     ppo_kwargs = {
         "gamma":       cfg.ppo.gamma,
-        "gae_lambda":  cfg.ppo.gae_lambda,  # NOTE: gae_lambda (not 'gae_gamma')
+        "gae_lambda":  cfg.ppo.gae_lambda,
         "n_steps":     cfg.ppo.n_steps,
         "batch_size":  cfg.ppo.batch_size,
         "clip_range":  cfg.ppo.clip_range,
@@ -325,7 +289,6 @@ def train_once(cfg) -> Path:
         action, _ = best_model.predict(obs, deterministic=True)
         obs, reward, done, info = test_env.step(action)
 
-    # --- IMPORTANT: adapt the keys below to whatever your env puts in info ---
     # Common pattern we’ve used: info[0]["ret"] = per-step portfolio return (after costs),
     # and info[0]["weights"] = current portfolio weights vector.
         if info and "ret" in info[0]:
@@ -392,7 +355,7 @@ def train_once(cfg) -> Path:
     print(f"[OK] Run recorded in: {rec.run_dir}")
     print("Saved: config.json, commit.txt, scaler.json, models/, eval/, metrics.json")
     #
-    # At the end (you already print the run path), just:
+    # At the end (run path already printed), just:
     return Path(rec.run_dir)
 
 

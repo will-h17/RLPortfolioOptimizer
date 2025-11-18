@@ -8,7 +8,8 @@ import optuna
 from optuna.pruners import MedianPruner
 
 from src.config_loader import load_config
-from src.train import train_once, _align_after_load, _clamp_dates_to_index
+from src.train import train_once
+from src.utils.data_utils import align_after_load, clamp_dates_to_index
 from src.scaler import FitOnTrainScaler
 from src.backtest import evaluate_sb3_model
 
@@ -18,14 +19,14 @@ from src.backtest import evaluate_sb3_model
 def suggest_params(trial: optuna.trial.Trial, base_cfg):
     cfg = deepcopy(base_cfg)
 
-    # --- PPO core knobs (SB3) ---
+    # PPO core knobs (SB3)
     cfg.ppo.learning_rate = trial.suggest_float("learning_rate", 1e-5, 5e-4, log=True)
     cfg.ppo.clip_range    = trial.suggest_float("clip_range",    0.05, 0.30)
     cfg.ppo.ent_coef      = trial.suggest_float("ent_coef",      1e-4, 1e-1, log=True)
     cfg.ppo.gae_lambda    = trial.suggest_float("gae_lambda",    0.80, 0.99)
     cfg.ppo.gamma         = trial.suggest_float("gamma",         0.90, 0.999)
 
-    # --- Optional reward shaping knobs ---
+    # Optional reward shaping knobs
     if hasattr(cfg, "reward"):
         if hasattr(cfg.reward, "turnover_penalty"):
             cfg.reward.turnover_penalty = trial.suggest_float("turnover_penalty", 0.0, 0.6)
@@ -34,7 +35,7 @@ def suggest_params(trial: optuna.trial.Trial, base_cfg):
         if hasattr(cfg.reward, "drawdown_penalty"):
             cfg.reward.drawdown_penalty = trial.suggest_float("drawdown_penalty", 0.0, 0.6)
 
-    # --- Trial budget: shorten timesteps for exploration ---
+    # Trial budget: shorten timesteps for exploration
     if hasattr(cfg, "train") and hasattr(cfg.train, "total_timesteps"):
         
         trial_ts = getattr(getattr(cfg, "hpo", object()), "trial_timesteps", None)
@@ -64,8 +65,8 @@ def eval_on_validation(run_dir: Path, cfg) -> float:
     feats  = feats.iloc[WARMUP:].copy()
 
     # Align and clamp dates
-    prices, feats = _align_after_load(prices, feats)
-    t_end, v_end, te_end = _clamp_dates_to_index(
+    prices, feats = align_after_load(prices, feats)
+    t_end, v_end, te_end = clamp_dates_to_index(
         pd.DatetimeIndex(feats.index),
         cfg.dates.train_end, cfg.dates.val_end, cfg.dates.test_end
     )
