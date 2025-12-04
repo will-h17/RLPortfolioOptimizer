@@ -1,0 +1,57 @@
+
+# run_dir: "artifacts/REPLACE_ME__your_latest_run"   # or leave blank to auto-pick latest
+
+universes:
+  ALL:
+    tickers: "*"          # "*" means keep all price columns
+  # CORE5:
+    # tickers: ["AAPL","MSFT","AMZN","GOOGL","META"]
+
+periods:
+  PRE_COVID:
+    start: "2017-01-01"
+    end:   "2019-12-31"
+  COVID_SHOCK:
+    start: "2020-02-15"
+    end:   "2020-06-30"
+  BEAR_2022:
+    start: "2022-01-01"
+    end:   "2022-12-31"
+  POST_2023:
+    start: "2023-01-01"
+    end:   "2025-12-31"   # clipped to data
+
+ablations:
+  # No costs, all features
+  - name: "nocost_allfeat"
+    cost_bps: 0
+    feature_keep: "*"     # keep all feature columns
+  # 5 bps costs, all features
+  - name: "5bps_allfeat"
+    cost_bps: 5
+    feature_keep: "*"
+  # 5 bps costs, only “price/vol” family features (example regex)
+  - name: "5bps_pricevol"
+    cost_bps: 5
+    feature_keep: "^(px_|ret_|vol_|s\\d+|_s\\d+)"
+  # 5 bps, shorter lookback tag (if your features encode lookbacks in names like *_L20)
+  - name: "5bps_shortLB"
+    cost_bps: 5
+    feature_keep: "(_L(10|20)|^px_|^ret_)"
+
+baselines:
+  vt_ew:
+    enabled: true
+    target_vol: 0.10
+    window: 60
+    rebalance: "W-FRI"
+  ivp:
+    enabled: true
+    window: 60
+    rebalance: "W-FRI"
+  momentum:
+    enabled: true
+    lookback_days: 252
+    skip_days: 21
+    top_frac: 0.3
+    rebalance: "M"

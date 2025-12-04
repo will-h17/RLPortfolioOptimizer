@@ -1,122 +1,79 @@
 """
-Data loading and preprocessing utilities.
+Data loading and preprocessing utilities (using yfinance).
 
-1) Download and cache Alpha Vantage "TIME_SERIES_DAILY_ADJUSTED" CSV for each symbol
-2) Load cached CVSs, align by date, keep *adjusted close* for total return consistency
-3) Fill missing data by forward-filling, then drop NaNs
-4) Persist a clean price matrix (Parquet) under data/processed/."""
+Pipeline:
+1) Download daily adjusted close prices for each symbol via yfinance.
+2) Cache CSVs under data/raw.
+3) Load cached CSVs, align by date, keep adjusted close.
+4) Forward-fill gaps, then drop any leading NaNs.
+5) Persist clean price matrix under data/processed/prices_adj.parquet.
+"""
+
 from __future__ import annotations
-
-import os
-import time
-import pandas as pd
-from typing import Optional, List
 from pathlib import Path
+from typing import List
+import pandas as pd
+import yfinance as yf
 
-import requests
+# ---------- Paths ----------
+SRC_DIR = Path(__file__).resolve().parent
+PROJECT_ROOT = SRC_DIR.parent
+DATA_DIR = PROJECT_ROOT / "data"
+RAW_DIR = DATA_DIR / "raw"
+PROC_DIR = DATA_DIR / "processed"
+RAW_DIR.mkdir(parents=True, exist_ok=True)
+PROC_DIR.mkdir(parents=True, exist_ok=True)
 
-RAW_DIR = os.path.join("data", "raw")
-PROC_DIR = os.path.join("data", "processed")
-ALPHA_BASE = "https://www.alphavantage.co/query"
 
-def _get_api_key(explicit_key: Optional[str] = None) -> str:
-    """Retrieve Alpha Vantage API key from environment variable."""
-    key = explicit_key = os.getenv("ALPHAVANTAGE_API_KEY")
-    if not key:
-        raise RuntimeError(
-            "Alpha Vantage API key not found. Please set the ALPHAVANTAGE_API_KEY environment variable."
-        )
-    return key
-
-def av_daily_adjusted(
-        symbol: str,
-        api_key: Optional[str] = None,
-        outdir: Path | str = RAW_DIR,
-        force: bool = False,
-        timeout: int = 30,) -> Path:
+def download_universe(symbols: List[str], force: bool = False) -> List[Path]:
     """
-    Download alpha vantage DAILY_ADJUSTED for one symbol and cache to CSV
-    """
-    outdir = Path(outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    path = outdir / f"{symbol}_daily_adjusted.csv"
-
-    if path.exists() and not force:
-        print(f"File {path} already exists. Skipping download.")
-        return path
-    
-    key = _get_api_key(api_key)
-    params = {
-        "function": "TIME_SERIES_DAILY_ADJUSTED",
-        "symbol": symbol,
-        "apikey": key,
-        "outputsize": "full",  #full history
-        "datatype": "csv",  #csv format
-    }
-
-    resp = requests.get(ALPHA_BASE, params=params, timeout=timeout)
-    resp.raise_for_status()
-
-    # Check for API call frequency limit message
-    text_head = resp.text[:128].lower()
-    if "thank you for using alpha vantage" in text_head and "please visit" in text_head:
-        # API call frequency exceeded
-        raise RuntimeError("API call frequency exceeded. Please try again later.")
-    with open(path, "wb") as f:
-        f.write(resp.content)
-
-    return path
-
-def download_universe(symbols: List[str], sleep_sec: float = 12.5, force: bool = False, api_key: Optional[str] = None) -> List[Path]:
-    """
-    Download and cache all symbols in the universe
+    Download daily adjusted data for all symbols and cache to CSV.
     """
     paths: List[Path] = []
-    for i, symbol in enumerate(symbols):
-        p = av_daily_adjusted(symbol, api_key=api_key, force=force)
-        paths.append(p)
-        # Sleep between requests, not after the last one
-        if i < len(symbols) - 1:
-            time.sleep(sleep_sec)
+    for sym in symbols:
+        path = RAW_DIR / f"{sym}_daily_adjusted.csv"
+        if path.exists() and not force:
+            print(f"[yfinance] cached {path.name}")
+            paths.append(path)
+            continue
+
+        print(f"[yfinance] downloading {sym}...")
+        df = yf.download(sym, period="max", auto_adjust=True)  # auto_adjust=True gives adjusted close
+        df = df.reset_index().rename(columns={"Date": "date"})
+        df = df[["date", "Close"]].rename(columns={"Close": sym})
+
+        df.to_csv(path, index=False)
+        print(f"[yfinance] wrote {path}")
+        paths.append(path)
     return paths
 
-def load_and_merge(symbols: List[str],
-                   rawdir: Path | str = RAW_DIR,
-                   processed: Path | str = PROC_DIR,
-                   out_name: str = "prices_adj.parquet",
-                   forward_fill: bool = True) -> pd.DataFrame:
-    """
-    Load all cached CSVs, align by date, keep adjusted close
-    """
-    rawdir = Path(rawdir)
-    processed = Path(processed)
-    processed.mkdir(parents=True, exist_ok=True)
 
+def load_and_merge(symbols: List[str], out_name: str = "prices_adj.parquet") -> pd.DataFrame:
     dfs = []
     for sym in symbols:
-        path = rawdir / f"{sym}_daily_adjusted.csv"
+        path = RAW_DIR / f"{sym}_daily_adjusted.csv"
         if not path.exists():
-            raise FileNotFoundError(f"File {path} does not exist. Please download the data first.")
-        df = pd.read_csv(path, parse_dates=["timestamp"])
-        # Keep the columns we trust downstream
-        df = df.rename(
-            columns={"timestamp": "date", "adjusted_close": sym}
-        )[["date", sym]].sort_values("date")
+            raise FileNotFoundError(f"Missing {path}. Run download_universe first.")
+        df = pd.read_csv(path, parse_dates=["date"])
+        # Ensure numeric
+        df[sym] = pd.to_numeric(df[sym], errors="coerce")
         dfs.append(df)
 
-    # Outer join to keep all dates
     merged = dfs[0]
     for df in dfs[1:]:
         merged = merged.merge(df, on="date", how="outer")
 
-    merged = merged.sort_values("date").set_index("date")
-    if forward_fill:
-        merged = merged.ffill()
+    merged = merged.sort_values("date").set_index("date").ffill().dropna(how="any")
 
-    # Drop any remaining NaNs (e.g. leading NaNs)
-    merged = merged.dropna(how="any")
-
-    out_path = processed / out_name
+    out_path = PROC_DIR / out_name
     merged.to_parquet(out_path)
-
+    print(f"[data] wrote {out_path}")
     return merged
+
+
+
+# CLI test
+if __name__ == "__main__":
+    SYMS = ["SPY", "QQQ", "TLT"]  # Example universe
+    download_universe(SYMS)
+    load_and_merge(SYMS)

@@ -1,0 +1,15 @@
+# configs/eval_grid.yaml
+run_dir: ""   # auto-pick latest
+universes:
+  ALL:
+    tickers: "*"
+periods:
+  SHORT_2020:
+    start: "2020-01-01"
+    end:   "2020-06-30"
+ablations:
+  - { name: "nocost_allfeat", cost_bps: 0, feature_keep: "*" }
+baselines:
+  vt_ew:    { enabled: true, target_vol: 0.10, window: 60, rebalance: "W-FRI" }
+  ivp:      { enabled: true, window: 60, rebalance: "W-FRI" }
+  momentum: { enabled: true, lookback_days: 252, skip_days: 21, top_frac: 0.3, rebalance: "M" }

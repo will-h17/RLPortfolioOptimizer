@@ -1,0 +1,57 @@
+run_name: "ppo_profitable"
+seed: 42
+paths:
+  prices: "data/processed/prices_adj.parquet"
+  features: "data/processed/features.parquet"
+  out_root: "artifacts"
+
+dates:
+  train_end: "2024-12-31"    # Adjust based on your data range
+  val_end: "2025-06-30"       # Adjust based on your data range
+  test_end: "2025-11-19"      # Adjust based on your data range (or use last available date)
+
+env:
+  transaction_cost_bps: 0
+  include_cash: true
+  cash_rate_annual: 0.02
+  normalize_obs_weights: true
+  
+  # Profitability-focused reward shaping
+  reward_return_bonus: 2.0              # 2x bonus for positive returns (encourages profitability)
+  reward_return_threshold: 0.0           # Reward any positive return
+  reward_compound_bonus: 0.05            # Small bonus for portfolio growth
+  reward_vol_scaling: true               # Enable but with softer scaling
+  reward_sharpe_bonus: 0.01              # Small Sharpe bonus (not dominant)
+  reward_vol_window: 20
+
+reward:
+  return_weight: 1.0
+  turnover_penalty: 0.0003               # Reduced penalty to allow more trading for returns
+  drawdown_penalty: 0.0
+  volatility_penalty: 0.0
+
+ppo:
+  learning_rate: 0.0001                  # Slightly higher for faster learning
+  gamma: 0.99                            # Standard discount
+  gae_lambda: 0.95
+  n_steps: 4096
+  batch_size: 512
+  clip_range: 0.2
+  ent_coef: 0.01                         # Higher exploration
+  policy_hidden_sizes: [256, 256, 128]
+
+train:
+  total_timesteps: 3000000               # 3M steps (good balance)
+  checkpoint_freq: 100000
+  eval_freq: 50000
+
+cost_model:
+  enabled: true
+  fee_bps: 0.0
+  slippage_bps: 0.0
+  spread:
+    type: "vol20"
+    fixed_bps: 2.0
+    k_vol_to_bps: 3000.0                # Reduced costs during training
+    vol_col_suffix: "_s20"
+
