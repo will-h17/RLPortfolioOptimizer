@@ -72,7 +72,7 @@ def load_and_merge(symbols: List[str], out_name: str = "prices_adj.parquet") -> 
 
 
 
-# --------------------------- CLI smoke test --------------------------- #
+# CLI test
 if __name__ == "__main__":
     SYMS = ["SPY", "QQQ", "TLT"]  # Example universe
     download_universe(SYMS)

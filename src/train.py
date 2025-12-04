@@ -3,7 +3,6 @@ import argparse
 from pathlib import Path
 import numpy as np
 import pandas as pd
-import torch
 import json
 from dataclasses import fields as dataclass_fields
 
@@ -12,34 +11,19 @@ from src.config_loader import load_config
 from src.splits import date_slices
 from src.scaler import FitOnTrainScaler
 from src.runlog import RunRecorder
-from src.env import PortfolioEnv, EnvConfig
+from src.env import PortfolioEnv, EnvConfig, make_env
 from src.agent import make_sb3_ppo
 from src.repro import set_global_seed, collect_versions
-from src.utils.data_utils import align_after_load, clamp_dates_to_index
+from src.utils.data_utils import align_after_load, clamp_dates_to_index, align_dataframes
+from src.utils.metrics import sharpe_ratio, max_drawdown, turnover
 # from src.utils.logging import make_loggers
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.callbacks import CheckpointCallback, EvalCallback
-from stable_baselines3.common.utils import set_random_seed as sb3_set_seed
 
 # make helpers importable by HPO:
-__all__ = ["train_once", "_align_after_load", "_clamp_dates_to_index"]
-
-
-# Utilities
-def set_global_seed(seed: int) -> None:
-    import random
-    random.seed(seed)
-    np.random.seed(seed)
-    torch.manual_seed(seed)
-    try:
-        torch.cuda.manual_seed_all(seed)
-        torch.backends.cudnn.deterministic = True
-        torch.backends.cudnn.benchmark = False
-    except Exception:
-        pass
+__all__ = ["train_once"]
 
 
 def build_env_config(cfg) -> EnvConfig:
@@ -56,10 +40,13 @@ def build_env_config(cfg) -> EnvConfig:
         "cash_rate_annual": getattr(cfg.env, "cash_rate_annual", 0.0),
         "normalize_obs_weights": getattr(cfg.env, "normalize_obs_weights", False),
         
-        # Advanced reward shaping for higher Sharpe
+        # Advanced reward shaping for profitability
         "reward_vol_scaling": getattr(cfg.env, "reward_vol_scaling", False),
         "reward_sharpe_bonus": getattr(cfg.env, "reward_sharpe_bonus", 0.0),
         "reward_vol_window": getattr(cfg.env, "reward_vol_window", 20),
+        "reward_return_bonus": getattr(cfg.env, "reward_return_bonus", 0.0),
+        "reward_return_threshold": getattr(cfg.env, "reward_return_threshold", 0.0),
+        "reward_compound_bonus": getattr(cfg.env, "reward_compound_bonus", 0.0),
 
         # Reward shaping knobs (only used if EnvConfig defines them)
         "return_weight": getattr(cfg.reward, "return_weight", 1.0),
@@ -89,45 +76,6 @@ def build_env_config(cfg) -> EnvConfig:
     return EnvConfig(**filtered)
 
 
-def make_env(prices=None, features=None, env_cfg: EnvConfig = None, seed: int = 0):
-    """
-    Factory that returns an env-initializer callable.
-
-    This accepts the original signature make_env(prices, features, env_cfg, seed)
-    but also has defaults so calls that omit arguments (e.g. make_env(cfg))
-    will not raise a static "missing arguments" error; instead a clear runtime
-    ValueError will be raised if required pieces are not provided.
-    """
-    def _init():
-        if prices is None or features is None or env_cfg is None:
-            raise ValueError("make_env requires (prices, features, env_cfg, seed); called with missing or None arguments.")
-        env = PortfolioEnv(prices=prices, features=features, config=env_cfg)
-        if hasattr(env, "seed"):
-            env.seed(seed)
-        # gymnasium-style (optional)
-        try:
-            env.action_space.seed(seed)
-            env.observation_space.seed(seed)
-        except Exception:
-            pass
-        return Monitor(env)
-    return _init
-
-
-
-
-
-def _align_split(P: pd.DataFrame, X: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    common = P.index.intersection(X.index)
-    if len(common) == 0:
-        raise ValueError(
-            "No overlap between prices and features for this split. "
-            "This usually means your date cutoffs fell outside the usable index. "
-            "Check the printed [data] usable rows and adjust your config dates."
-        )
-    if len(common) < len(P.index) or len(common) < len(X.index):
-        print(f"[align] trimming split: prices {len(P)}→{len(common)}, features {len(X)}→{len(common)}")
-    return P.loc[common], X.loc[common]
 
 
 
@@ -145,16 +93,8 @@ def train_once(cfg) -> Path:
     Runs one full training job using the existing logic in main().
     Returns the run directory containing models/, scaler.json, eval/, metrics.json, etc.
     """
-    set_global_seed(cfg.seed)
-    sb3_set_seed(cfg.seed)  # SB3’s own RNGs
-
-    try:
-        import torch as th
-        th.use_deterministic_algorithms(True)
-        th.backends.cudnn.deterministic = True
-        th.backends.cudnn.benchmark = False
-    except Exception:
-        pass
+    # Set global seed (handles random, numpy, torch, SB3, and deterministic algorithms)
+    set_global_seed(cfg.seed, deterministic=True)
 
     # Paths
     prices_path   = Path(cfg.paths.prices)
@@ -191,9 +131,6 @@ def train_once(cfg) -> Path:
     )
     print(f"[dates] using train_end={t_end}, val_end={v_end}, test_end={te_end}")
 
-    # Make a unique run folder + record config/commit hash
-    rec = RunRecorder(run_name=cfg.run_name, out_root=str(out_root), cfg_obj=cfg)
-
     # Time split (leak-proof)
     idx = prices.index  # same as feats.index now
     t_end_ts  = pd.to_datetime(t_end)
@@ -219,13 +156,30 @@ def train_once(cfg) -> Path:
     scaler.save(rec.path("scaler.json"))
     X_trz, X_vaz, X_tez = scaler.transform(X_tr), scaler.transform(X_va), scaler.transform(X_te)
 
-    P_tr, X_tr = _align_split(P_tr, X_tr)
-    P_va, X_va = _align_split(P_va, X_va)
-    P_te, X_te = _align_split(P_te, X_te)
+    # Align splits (no NaN dropping needed as features are already clean from align_after_load)
+    P_tr, X_tr = align_dataframes(P_tr, X_tr, dropna=False, show_trimming=True, context="train split")
+    P_va, X_va = align_dataframes(P_va, X_va, dropna=False, show_trimming=True, context="validation split")
+    P_te, X_te = align_dataframes(P_te, X_te, dropna=False, show_trimming=True, context="test split")
 
     # Build EnvConfig safely and vec envs
     env_cfg  = build_env_config(cfg)
+    
+    # Verify training data is reasonable
+    if len(P_tr) < 100:
+        raise ValueError(f"Training data too small: {len(P_tr)} rows. Check date splits.")
+    
+    print(f"[env] Creating training environment with {len(P_tr)} data points")
     env      = DummyVecEnv([make_env(P_tr, X_trz, env_cfg, seed=cfg.seed)])
+    
+    # Test that environment works correctly (sample action from action space)
+    test_obs = env.reset()
+    test_action = [env.action_space.sample() for _ in range(env.num_envs)]
+    test_obs, test_reward, test_done, test_info = env.step(test_action)
+    print(f"[env] Environment test: obs_shape={test_obs.shape}, reward={test_reward[0]:.6f}, done={test_done[0]}")
+    if test_done[0]:
+        print(f"[env] WARNING: Environment done after 1 step! This will cause training issues.")
+    env.reset()  # Reset after test
+    
     eval_env = DummyVecEnv([make_env(P_va, X_vaz, env_cfg, seed=cfg.seed + 1)])
 
     # PPO kwargs (SB3) pulled from config — only SB3 parameters here
@@ -236,7 +190,7 @@ def train_once(cfg) -> Path:
         "batch_size":  cfg.ppo.batch_size,
         "clip_range":  cfg.ppo.clip_range,
         "ent_coef":    cfg.ppo.ent_coef,
-        # add more SB3 knobs here if you include them in your config:
+        # add more SB3 knobs here if included in config:
         # "vf_coef": cfg.ppo.vf_coef,
         # "max_grad_norm": cfg.ppo.max_grad_norm,
     }
@@ -267,19 +221,46 @@ def train_once(cfg) -> Path:
         eval_freq=cfg.train.eval_freq,
         deterministic=True,
         render=False,
+        n_eval_episodes=1,  # Explicitly set to avoid issues
+        verbose=1,  # Show evaluation progress
     )
 
-    # Train
-    model.learn(total_timesteps=cfg.train.total_timesteps, callback=[checkpoint_cb, eval_cb])
+    # Train with progress printing
+    print(f"[train] Starting PPO training for {cfg.train.total_timesteps:,} timesteps")
+    print(f"[train] n_steps per update: {cfg.ppo.n_steps}")
+    print(f"[train] Training data: {len(P_tr)} rows")
+    print(f"[train] Episode length: ~{len(P_tr) - 2} steps")
+    print(f"[train] Expected updates: ~{cfg.train.total_timesteps // cfg.ppo.n_steps}")
+    print(f"[train] Eval frequency: every {cfg.train.eval_freq:,} steps")
+    print(f"[train] Checkpoint frequency: every {cfg.train.checkpoint_freq:,} steps")
+    
+    try:
+        model.learn(total_timesteps=cfg.train.total_timesteps, callback=[checkpoint_cb, eval_cb], progress_bar=True)
+        print(f"[train] Training completed successfully! Total timesteps: {cfg.train.total_timesteps:,}")
+    except Exception as e:
+        print(f"[train] ERROR during training: {e}")
+        import traceback
+        traceback.print_exc()
+        raise
 
-    # 1) Load the best checkpoint chosen by EvalCallback
+    # Load the best checkpoint chosen by EvalCallback
     best_model_zip = rec.path("models", "best", "best_model.zip")
+    if not best_model_zip.exists():
+        # Fallback: try to find any model
+        model_zips = list(rec.path("models").glob("*.zip"))
+        if model_zips:
+            best_model_zip = model_zips[0]
+            print(f"[train] Warning: best_model.zip not found, using {best_model_zip.name}")
+        else:
+            raise FileNotFoundError(f"No model found in {rec.path('models')}. Training may have failed.")
+    
+    print(f"[train] Loading best model from: {best_model_zip}")
     best_model = PPO.load(str(best_model_zip))
 
-    # 2) Build a TEST env using the *same* env config and the saved TRAIN scaler
+    # Build a TEST env using the *same* env config and the saved TRAIN scaler
     test_env = DummyVecEnv([make_env(P_te, X_tez, env_cfg, seed=cfg.seed + 2)])
 
-    # 3) Roll out deterministically once to collect returns/weights
+    # Roll out deterministically once to collect returns/weights
     obs = test_env.reset()
     done = [False]
     step_rewards = []
@@ -297,40 +278,21 @@ def train_once(cfg) -> Path:
         # ensure it's a 1D numpy array
             step_weights.append(np.asarray(info[0]["weights"], dtype=float))
 
-    # 4) Compute test metrics (annualized Sharpe, Max Drawdown, Turnover)
+    # Compute test metrics (annualized Sharpe, Max Drawdown, Turnover)
     rets = np.array(step_rewards, dtype=float)
     equity = (1.0 + rets).cumprod()
 
-    def _sharpe_daily(x: np.ndarray) -> float:
-        mu = x.mean()
-        sig = x.std()
-        return float(np.sqrt(252.0) * mu / (sig + 1e-12))
+    test_sharpe = sharpe_ratio(rets) if len(rets) > 1 else 0.0
+    test_mdd    = max_drawdown(equity) if len(equity) > 1 else 0.0  # Returns negative (e.g., -0.23 for -23%)
+    test_tov    = turnover(step_weights)
 
-    def _max_drawdown(eq: np.ndarray) -> float:
-    # returns negative number (e.g., -0.23 for -23%)
-        peak = np.maximum.accumulate(eq)
-        dd = eq / peak - 1.0
-        return float(dd.min())
-
-    def _avg_turnover(weights_seq: list[np.ndarray]) -> float:
-        if len(weights_seq) < 2:
-            return 0.0
-        W = np.vstack(weights_seq)  # shape [T, N]
-        # L1 change per step, then average across steps
-        per_step = np.abs(np.diff(W, axis=0)).sum(axis=1)
-        return float(per_step.mean())
-
-    test_sharpe = _sharpe_daily(rets) if len(rets) > 1 else 0.0
-    test_mdd    = _max_drawdown(equity) if len(equity) > 1 else 0.0
-    test_tov    = _avg_turnover(step_weights)
-
-    # 5) Save arrays for inspection (optional)
+    # Save arrays for inspection
     np.save(rec.path("eval", "test_equity.npy"), equity)
     np.save(rec.path("eval", "test_returns.npy"), rets)
     if len(step_weights):
         np.save(rec.path("eval", "test_weights.npy"), np.vstack(step_weights))
 
-    # 6) Write metrics.json to the run folder
+    # Write metrics.json to the run folder
     metrics = {
         "split": "test",
         "timesteps": cfg.train.total_timesteps,
@@ -354,8 +316,7 @@ def train_once(cfg) -> Path:
 
     print(f"[OK] Run recorded in: {rec.run_dir}")
     print("Saved: config.json, commit.txt, scaler.json, models/, eval/, metrics.json")
-    #
-    # At the end (run path already printed), just:
+    # At the end (run path already printed)
     return Path(rec.run_dir)
 
 

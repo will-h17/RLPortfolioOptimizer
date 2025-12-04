@@ -41,10 +41,13 @@ class EnvCfg:
     include_cash: bool = True
     cash_rate_annual: float = 0.0
     normalize_obs_weights: bool = False
-    # Advanced reward shaping for higher Sharpe
+    # Advanced reward shaping for profitability
     reward_vol_scaling: bool = False
     reward_sharpe_bonus: float = 0.0
     reward_vol_window: int = 20
+    reward_return_bonus: float = 0.0  # Bonus multiplier for positive returns
+    reward_return_threshold: float = 0.0  # Minimum return to get bonus
+    reward_compound_bonus: float = 0.0  # Bonus for cumulative returns
 
 @dataclass
 class RewardCfg:
@@ -103,6 +106,14 @@ def _load_raw(path: str | Path) -> Dict[str, Any]:
 
 def load_config(path: str | Path) -> AppCfg:
     raw = _load_raw(path)
+    
+    # Validate required fields
+    if "run_name" not in raw:
+        raise ValueError(f"Config file missing required field 'run_name'. File: {path}\n"
+                        f"Available keys: {list(raw.keys())}")
+    if "seed" not in raw:
+        raise ValueError(f"Config file missing required field 'seed'. File: {path}")
+    
     return AppCfg(
         run_name = raw["run_name"],
         seed     = int(raw["seed"]),

@@ -13,7 +13,7 @@ def date_slices(index: pd.DatetimeIndex,
                 train_end: str,
                 val_end: str,
                 test_end: str) -> TimeSplit:
-    """Return integer slices for train/val/test using *dates* (inclusive boundaries)."""
+    """Return integer slices for train/val/test using dates (inclusive boundaries)."""
     def pos(d): 
         return int(index.get_indexer([pd.to_datetime(d)], method="bfill")[0])
     i_train_end = pos(train_end)

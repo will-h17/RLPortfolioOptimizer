@@ -13,6 +13,12 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
+try:
+    from stable_baselines3.common.monitor import Monitor
+except ImportError:
+    # Fallback for environments without SB3 installed
+    Monitor = lambda x: x  # no-op wrapper
+
 # Paths
 SRC_DIR = Path(__file__).resolve().parent
 PROJECT_ROOT = SRC_DIR.parent
@@ -79,10 +85,15 @@ class EnvConfig:
     # Observation normalization (optional, for RL training stability)
     normalize_obs_weights: bool = False  # If True, normalize weights relative to equal-weight
 
-    # Advanced reward shaping for higher Sharpe
+    # Advanced reward shaping for profitability
     reward_vol_scaling: bool = False  # Scale reward by Sharpe-like metric (preserves returns, reduces vol → higher Sharpe AND final value)
     reward_sharpe_bonus: float = 0.0  # Bonus for high rolling Sharpe (0.0 = disabled)
     reward_vol_window: int = 20  # Window for rolling volatility/Sharpe calculation
+    
+    # Profitability-focused reward shaping
+    reward_return_bonus: float = 0.0  # Bonus multiplier for positive returns (encourages profitability)
+    reward_return_threshold: float = 0.0  # Minimum return to get bonus (0.0 = any positive return)
+    reward_compound_bonus: float = 0.0  # Bonus for cumulative returns (encourages growth)
 
     @property
     def cash_daily_rate(self) -> float:
@@ -165,7 +176,7 @@ class PortfolioEnv(gym.Env):
         self._t0 = max(self._start + 1, 1)
         self.t = self._t0  # Use self.t consistently (not self._t)
 
-        # Start equal-weight (or your preferred initial weights)
+        # Start equal-weight
         self._w = np.ones(self.n_assets, dtype=np.float32) / self.n_assets
         self._value = 1.0
 
@@ -193,7 +204,7 @@ class PortfolioEnv(gym.Env):
         self._value = 1.0
         self._portfolio_returns = []  # Reset return history
         self.done = False
-        obs = self._obs()   # whatever you use to build an observation at time t
+        obs = self._obs()  # observation at time t
         info = {}
         return obs, info
     
@@ -241,28 +252,51 @@ class PortfolioEnv(gym.Env):
         # Track portfolio return for volatility/Sharpe calculations
         self._portfolio_returns.append(base)
         
-        # Advanced reward shaping for higher Sharpe
+        # Advanced reward shaping for profitability
         reward = rw * base - pen_turn
         
+        # Return bonus: encourage positive returns (profitability focus)
+        return_bonus_coef = float(getattr(self.config, "reward_return_bonus", 0.0))
+        return_threshold = float(getattr(self.config, "reward_return_threshold", 0.0))
+        if return_bonus_coef > 0.0 and base > return_threshold:
+            # Bonus for positive returns - encourages profitability
+            # Multiplier: 1.0 + bonus_coef * return (capped at 0.1 to avoid explosion)
+            # Example: return_bonus_coef=2.0, base=0.01 → multiplier = 1.0 + 2.0*0.01 = 1.02
+            bonus_multiplier = 1.0 + return_bonus_coef * min(base, 0.1)
+            reward = reward * bonus_multiplier
+        
+        # Compound bonus: reward cumulative growth (encourages long-term profitability)
+        compound_bonus_coef = float(getattr(self.config, "reward_compound_bonus", 0.0))
+        if compound_bonus_coef > 0.0 and self._value > 1.0:
+            # Bonus based on portfolio value growth
+            growth_factor = max(0.0, (self._value - 1.0) / 10.0)  # Normalize growth
+            reward = reward + compound_bonus_coef * growth_factor
+        
         # Volatility scaling: scale reward by Sharpe-like metric (preserves returns, reduces vol)
-        # This encourages the agent to reduce volatility while maintaining returns → increases Sharpe AND final value
+        # This encourages the agent to reduce volatility while maintaining returns → increases Sharpe and final value
         if getattr(self.config, "reward_vol_scaling", False):
             vol_window = int(getattr(self.config, "reward_vol_window", 20))
+            # Only apply scaling if we have enough history (avoid issues at episode start)
             if len(self._portfolio_returns) >= vol_window:
                 recent_rets = np.array(self._portfolio_returns[-vol_window:], dtype=np.float64)
                 rolling_mean = float(np.mean(recent_rets))
                 rolling_vol = float(np.std(recent_rets))
                 if rolling_vol > 1e-6:
                     # Scale by Sharpe-like metric: mean / (vol + epsilon)
-                    # This preserves returns while penalizing high volatility
-                    # Higher Sharpe → higher scaled reward (encourages both high returns AND low vol)
-                    sharpe_scale = rolling_mean / (rolling_vol + 0.01)
-                    # Normalize to reasonable scale (avoid extreme values)
-                    # Clip to [0.1, 10.0] to prevent reward explosion or collapse
-                    sharpe_scale = np.clip(sharpe_scale, 0.1, 10.0)
+                    # Make it less aggressive to preserve returns
+                    # Use a softer scaling that doesn't penalize returns as much
+                    sharpe_ratio = rolling_mean / (rolling_vol + 0.01)
+                    # Only apply if Sharpe is very low (very bad risk-adjusted returns)
+                    # Otherwise, preserve the reward to encourage returns
+                    if sharpe_ratio < 0.5:  # Only scale down if Sharpe is very poor
+                        sharpe_scale = np.clip(sharpe_ratio / 0.5, 0.5, 1.0)  # Scale between 0.5 and 1.0
+                    else:
+                        sharpe_scale = 1.0 + 0.1 * min(sharpe_ratio - 0.5, 2.0)  # Slight bonus for good Sharpe
+                    sharpe_scale = np.clip(sharpe_scale, 0.5, 2.0)  # Wider range, less aggressive
                     reward = reward * sharpe_scale
+            # If we don't have enough history yet, use unscaled reward (normal behavior)
         
-        # Sharpe bonus: add bonus for high rolling Sharpe
+        # Sharpe bonus: add bonus for high rolling Sharpe (but smaller to not override returns)
         sharpe_bonus_coef = float(getattr(self.config, "reward_sharpe_bonus", 0.0))
         if sharpe_bonus_coef > 0.0:
             vol_window = int(getattr(self.config, "reward_vol_window", 20))
@@ -272,8 +306,8 @@ class PortfolioEnv(gym.Env):
                 rolling_vol = float(np.std(recent_rets))
                 if rolling_vol > 1e-6:
                     rolling_sharpe = rolling_mean / rolling_vol * np.sqrt(252.0)  # Annualized
-                    # Bonus proportional to Sharpe (clipped to avoid extreme values)
-                    sharpe_bonus = sharpe_bonus_coef * np.clip(rolling_sharpe, -5.0, 5.0)
+                    # Smaller bonus to not override return focus
+                    sharpe_bonus = sharpe_bonus_coef * 0.1 * np.clip(rolling_sharpe, -5.0, 5.0)
                     reward = reward + sharpe_bonus
 
         # Advance state
@@ -361,6 +395,54 @@ class PortfolioEnv(gym.Env):
         # crossing half-spread once + fee + slippage
         per_asset_bps = fee + slp + 0.5 * spread_bps
         return per_asset_bps
+
+
+def make_env(prices=None, features=None, env_cfg: Optional[EnvConfig] = None, seed: int = 0):
+    """
+    Factory function that returns an environment initializer callable.
+    
+    This function creates a factory for creating PortfolioEnv instances wrapped
+    in a Monitor. It's designed to work with Stable Baselines3's DummyVecEnv,
+    which expects a callable that returns an environment instance.
+    
+    Args:
+        prices: DataFrame of asset prices (indexed by date)
+        features: DataFrame of features (indexed by date, must align with prices)
+        env_cfg: EnvConfig instance for environment configuration
+        seed: Random seed for reproducibility
+    
+    Returns:
+        Callable that, when called, returns a Monitor-wrapped PortfolioEnv
+    
+    Example:
+        env_factory = make_env(prices_df, features_df, env_config, seed=42)
+        env = env_factory()  # Returns Monitor(PortfolioEnv(...))
+        
+        # Or use with DummyVecEnv:
+        vec_env = DummyVecEnv([make_env(prices, features, cfg, seed=42)])
+    """
+    def _init():
+        if prices is None or features is None or env_cfg is None:
+            raise ValueError(
+                "make_env requires (prices, features, env_cfg, seed); "
+                "called with missing or None arguments."
+            )
+        env = PortfolioEnv(prices=prices, features=features, config=env_cfg)
+        
+        # Set seed on environment if supported
+        if hasattr(env, "seed"):
+            env.seed(seed)
+        
+        # Gymnasium-style seed setting
+        try:
+            env.action_space.seed(seed)
+            env.observation_space.seed(seed)
+        except Exception:
+            pass  # Ignore if not supported
+        
+        return Monitor(env)
+    
+    return _init
 
 
 # self-test 

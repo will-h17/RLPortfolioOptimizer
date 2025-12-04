@@ -12,7 +12,7 @@ from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3 import PPO
 
 
-# ---------------- Dirichlet distribution wrapper (no SB3 inheritance) ---------------- #
+# ---------------- Dirichlet distribution wrapper ---------------- #
 
 class _DirichletWrapper:
     """Light wrapper around torch.distributions.Dirichlet with helpers SB3 expects."""
@@ -99,7 +99,7 @@ class DirichletActorCriticPolicy(ActorCriticPolicy):
         log_prob = dist.log_prob(actions)
         values = self.value_net(latent_vf).flatten()
 
-        # Paranoia: normalize precisely to simplex
+        # normalize precisely to simplex
         actions = th.clamp(actions, 1e-8, 1.0)
         actions = actions / actions.sum(dim=-1, keepdim=True)
         return actions, values, log_prob

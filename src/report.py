@@ -1,5 +1,5 @@
 """
-report.py — Generate performance visualizations for RL portfolio optimizer.
+report.py — Generate performance visualizations
 
 - Runs backtests for Buy & Hold, Equal Weight, RL Agent
 - Plots equity curves, metrics comparison, and allocation heatmap
@@ -41,7 +41,7 @@ def generate_report(run_dir: str | Path | None = None):
     prices = pd.read_parquet("data/processed/prices_adj.parquet")
     features = pd.read_parquet("data/processed/features.parquet")
     
-    # Align data (same as training)
+    # Align data
     prices, features = align_after_load(prices, features)
 
     # Baselines
@@ -137,25 +137,82 @@ def generate_report(run_dir: str | Path | None = None):
     plt.savefig("reports/equity_curves.png")
     plt.close()
 
-    # 2. Metrics Comparison
-    labels = ["Final Value", "Sharpe", "Max DD", "Turnover"]
-    bh_vals = [bh["metrics"][k] for k in ["final_value", "sharpe", "max_drawdown", "turnover"]]
-    ew_vals = [ew["metrics"][k] for k in ["final_value", "sharpe", "max_drawdown", "turnover"]]
-    rl_vals = [rl["metrics"][k] for k in ["final_value", "sharpe", "max_drawdown", "turnover"]] if rl else [0, 0, 0, 0]
-
-    x = np.arange(len(labels))
-    width = 0.25
-    fig, ax = plt.subplots(figsize=(10, 5))
-    ax.bar(x - width, bh_vals, width, label="Buy & Hold")
-    ax.bar(x, ew_vals, width, label="Equal Weight")
-    if rl:
-        ax.bar(x + width, rl_vals, width, label="RL Agent")
-    ax.set_xticks(x)
-    ax.set_xticklabels(labels)
-    ax.set_title("Performance Metrics Comparison")
-    ax.legend()
+    # 2. Metrics Comparison - Separate subplots for better visibility
+    fig, axes = plt.subplots(2, 2, figsize=(14, 10))
+    fig.suptitle("Performance Metrics Comparison", fontsize=16, fontweight='bold')
+    
+    strategies = ["Buy & Hold", "Equal Weight"]
+    colors = ['#1f77b4', '#ff7f0e', '#2ca02c']  # Blue, Orange, Green
+    
+    # Extract metrics
+    bh_metrics = bh["metrics"]
+    ew_metrics = ew["metrics"]
+    rl_metrics = rl["metrics"] if rl else None
+    
+    # 1. Final Value (top-left)
+    ax = axes[0, 0]
+    strategies_plot = strategies.copy()
+    values = [bh_metrics["final_value"], ew_metrics["final_value"]]
+    if rl_metrics:
+        strategies_plot.append("RL Agent")
+        values.append(rl_metrics["final_value"])
+    bars = ax.bar(strategies_plot, values, color=colors[:len(values)])
+    ax.set_ylabel("Final Portfolio Value", fontweight='bold')
+    ax.set_title("Final Value", fontsize=12, fontweight='bold')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{val:.2f}', ha='center', va='bottom', fontweight='bold')
+    
+    # 2. Sharpe Ratio (top-right)
+    ax = axes[0, 1]
+    values = [bh_metrics["sharpe"], ew_metrics["sharpe"]]
+    if rl_metrics:
+        values.append(rl_metrics["sharpe"])
+    bars = ax.bar(strategies_plot, values, color=colors[:len(values)])
+    ax.set_ylabel("Annualized Sharpe Ratio", fontweight='bold')
+    ax.set_title("Sharpe Ratio", fontsize=12, fontweight='bold')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{val:.3f}', ha='center', va='bottom', fontweight='bold')
+    
+    # 3. Max Drawdown (bottom-left) - Note: max_drawdown is negative
+    ax = axes[1, 0]
+    values = [bh_metrics["max_drawdown"], ew_metrics["max_drawdown"]]
+    if rl_metrics:
+        values.append(rl_metrics["max_drawdown"])
+    bars = ax.bar(strategies_plot, values, color=colors[:len(values)])
+    ax.set_ylabel("Maximum Drawdown", fontweight='bold')
+    ax.set_title("Max Drawdown (negative = loss)", fontsize=12, fontweight='bold')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{val:.3f}', ha='center', va='top' if height < 0 else 'bottom', fontweight='bold')
+    
+    # 4. Turnover (bottom-right)
+    ax = axes[1, 1]
+    values = [bh_metrics["turnover"], ew_metrics["turnover"]]
+    if rl_metrics:
+        values.append(rl_metrics["turnover"])
+    bars = ax.bar(strategies_plot, values, color=colors[:len(values)])
+    ax.set_ylabel("Average Turnover per Period", fontweight='bold')
+    ax.set_title("Portfolio Turnover", fontsize=12, fontweight='bold')
+    ax.grid(axis='y', alpha=0.3, linestyle='--')
+    # Add value labels on bars
+    for bar, val in zip(bars, values):
+        height = bar.get_height()
+        ax.text(bar.get_x() + bar.get_width()/2., height,
+                f'{val:.4f}', ha='center', va='bottom', fontweight='bold')
+    
     plt.tight_layout()
-    plt.savefig("reports/metrics_comparison.png")
+    plt.savefig("reports/metrics_comparison.png", dpi=150, bbox_inches='tight')
     plt.close()
 
     # 3. RL Allocation Heatmap

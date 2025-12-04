@@ -1,5 +1,4 @@
 run_name: "ppo_sharpe_optimized"
-
 seed: 42
 paths:
   prices: "data/processed/prices_adj.parquet"

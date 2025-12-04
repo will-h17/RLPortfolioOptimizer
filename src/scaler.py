@@ -6,8 +6,8 @@ import pandas as pd
 
 class FitOnTrainScaler:
     """
-    Z-score per column using *train-only* stats.
-    Works with pandas Index or MultiIndex columns.
+    Z-score per column using train-only stats
+    Works with pandas Index or MultiIndex columns
     """
     def __init__(self):
         self.mu_: pd.Series | None = None
@@ -26,7 +26,7 @@ class FitOnTrainScaler:
         sigma = self.sigma_.reindex(X.columns).replace(0.0, 1.0)
         return (X - mu) / sigma
 
-    # simple artifact I/O (JSON + parquet are both fine; JSON keeps it light)
+    # simple artifact I/O (JSON + parquet are both fine, but JSON keeps it light)
     def save(self, path: str | Path) -> None:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -35,7 +35,7 @@ class FitOnTrainScaler:
         if getattr(self, "mu_", None) is None or getattr(self, "sigma_", None) is None:
             raise RuntimeError("Scaler not fitted. Call fit(X_train) before save().")
 
-        # JSON keys must be strings; MultiIndex / tuple keys are converted to strings here.
+        # JSON keys must be strings; MultiIndex / tuple keys are converted to strings here
         mu_dict_raw = self.mu_.to_dict()
         sigma_dict_raw = self.sigma_.to_dict()
         mu_dict = {str(k): float(v) for k, v in mu_dict_raw.items()}

@@ -1,7 +1,6 @@
-# tests/test_turnover_and_metrics.py
 import numpy as np
-from src.baselines import _avg_turnover as avg_turnover  # same logic used in your metrics
-from src.baselines import _max_drawdown as max_dd, _sharpe_daily as sharpe
+from src.utils.metrics import turnover as avg_turnover
+from src.utils.metrics import max_drawdown as max_dd, sharpe_ratio as sharpe
 
 def test_turnover_l1_mean():
     W = np.array([
@@ -19,6 +18,6 @@ def test_metrics_sharpe_and_mdd():
     eq = (1 + rets).cumprod()
     s = sharpe(rets)
     mdd = max_dd(eq)
-    # For this toy series mean≈0 → Sharpe≈0. Just ensure finite and mdd is negative and modest.
+    # For this series mean≈0 → Sharpe≈0. Just ensure finite and mdd is negative and modest.
     assert np.isfinite(s)
     assert mdd <= 0.0 and mdd >= -0.03

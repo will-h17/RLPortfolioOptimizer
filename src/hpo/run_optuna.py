@@ -1,5 +1,6 @@
 from __future__ import annotations
 import argparse
+import json
 from copy import deepcopy
 from pathlib import Path
 import numpy as np
@@ -98,18 +99,79 @@ def eval_on_validation(run_dir: Path, cfg) -> float:
     return float(res["metrics"]["sharpe"])
 
 
+# JSON storage helpers
+def save_trial_to_json(trial: optuna.trial.Trial, study_name: str, output_dir: Path):
+    """Save a single trial result to JSON file."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    trial_file = output_dir / f"{study_name}_trial_{trial.number:04d}.json"
+    
+    trial_data = {
+        "trial_number": trial.number,
+        "params": trial.params,
+        "value": trial.value,
+        "state": trial.state.name if hasattr(trial.state, 'name') else str(trial.state),
+        "datetime_start": trial.datetime_start.isoformat() if trial.datetime_start else None,
+        "datetime_complete": trial.datetime_complete.isoformat() if trial.datetime_complete else None,
+    }
+    
+    trial_file.write_text(json.dumps(trial_data, indent=2))
+    return trial_file
+
+def load_trials_from_json(study_name: str, output_dir: Path) -> list:
+    """Load all trial results from JSON files."""
+    trials = []
+    for trial_file in sorted(output_dir.glob(f"{study_name}_trial_*.json")):
+        try:
+            data = json.loads(trial_file.read_text())
+            trials.append(data)
+        except Exception as e:
+            print(f"Warning: Could not load {trial_file}: {e}")
+    return trials
+
+def save_study_summary(study: optuna.Study, study_name: str, output_dir: Path):
+    """Save study summary to JSON."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    summary_file = output_dir / f"{study_name}_summary.json"
+    
+    # Get all trials data
+    trials_data = []
+    for trial in study.trials:
+        trials_data.append({
+            "trial_number": trial.number,
+            "params": trial.params,
+            "value": trial.value,
+            "state": trial.state.name if hasattr(trial.state, 'name') else str(trial.state),
+        })
+    
+    summary = {
+        "study_name": study_name,
+        "n_trials": len(study.trials),
+        "best_value": study.best_value,
+        "best_params": study.best_params,
+        "best_trial_number": study.best_trial.number if study.best_trial else None,
+        "trials": trials_data,
+    }
+    
+    summary_file.write_text(json.dumps(summary, indent=2))
+    return summary_file
+
 # Optuna objective
-def objective(trial: optuna.trial.Trial, base_cfg):
+def objective(trial: optuna.trial.Trial, base_cfg, study_name: str, output_dir: Path):
     cfg_trial = suggest_params(trial, base_cfg)
 
-    # Run a normal training job using your exact pipeline
+    # Run a normal training job
     run_dir = train_once(cfg_trial)
 
-    # Score on the validation slice (not the test slice!)
+    # Score on the validation slice
     val_sharpe = eval_on_validation(run_dir, cfg_trial)
 
     # Report so pruners can act if you later add intermediate steps
     trial.report(val_sharpe, step=1)
+    
+    # Save trial result to JSON
+    if trial.state == optuna.trial.TrialState.COMPLETE:
+        save_trial_to_json(trial, study_name, output_dir)
+    
     return val_sharpe
 
 
@@ -118,23 +180,48 @@ def main():
     ap.add_argument("--config", required=True, help="Path to your YAML/JSON config")
     ap.add_argument("--n-trials", type=int, default=30)
     ap.add_argument("--study-name", default="ppo_hpo")
-    ap.add_argument("--storage", default=None, help='e.g. "sqlite:///hpo.db" (optional)')
+    ap.add_argument("--output-dir", default="artifacts/hpo", help="Directory to save JSON results")
+    ap.add_argument("--resume", action="store_true", help="Resume from existing JSON files")
     args = ap.parse_args()
 
     base_cfg = load_config(args.config)
+    output_dir = Path(args.output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
 
+    # Create study in memory
     study = optuna.create_study(
         direction="maximize",
         study_name=args.study_name,
-        storage=args.storage,
-        load_if_exists=True,
         pruner=MedianPruner(n_warmup_steps=1),
     )
-    study.optimize(lambda t: objective(t, base_cfg), n_trials=args.n_trials, gc_after_trial=True)
+    
+    # Resume from JSON if requested
+    if args.resume:
+        existing_trials = load_trials_from_json(args.study_name, output_dir)
+        if existing_trials:
+            print(f"[resume] Found {len(existing_trials)} existing trials in {output_dir}")
+            # Re-enqueue completed trials to avoid re-running them
+            for trial_data in existing_trials:
+                if trial_data.get("state") == "COMPLETE":
+                    study.enqueue_trial(trial_data["params"])
+            print(f"[resume] Re-enqueued {len([t for t in existing_trials if t.get('state') == 'COMPLETE'])} completed trials")
+    
+    # Run optimization with JSON saving
+    study.optimize(
+        lambda t: objective(t, base_cfg, args.study_name, output_dir),
+        n_trials=args.n_trials,
+        gc_after_trial=True
+    )
 
+    # Save final summary
+    summary_file = save_study_summary(study, args.study_name, output_dir)
+    
     print("\n=== HPO complete ===")
     print("Best Sharpe:", study.best_value)
-    print("Best params:", study.best_trial.params)
+    print("Best params:", study.best_params)
+    print(f"\nResults saved to: {output_dir}")
+    print(f"Summary: {summary_file}")
+    print(f"Individual trials: {output_dir}/{args.study_name}_trial_*.json")
 
 
 if __name__ == "__main__":

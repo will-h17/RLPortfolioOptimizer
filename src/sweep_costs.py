@@ -5,16 +5,14 @@ import numpy as np
 import pandas as pd
 from stable_baselines3 import PPO
 from stable_baselines3.common.vec_env import DummyVecEnv
-from stable_baselines3.common.monitor import Monitor
 
 from src.config_loader import load_config
 from src.runlog import RunRecorder
 from src.scaler import FitOnTrainScaler
-from src.env import PortfolioEnv, EnvConfig
+from src.env import EnvConfig, make_env
 from src.splits import date_slices
 from src.utils.data_utils import align_after_load, clamp_dates_to_index
-
-# Note: clamp_dates_to_index returns strings, convert to Timestamps if needed
+from src.utils.metrics import sharpe_ratio, max_drawdown, turnover
 
 def _load_data(cfg):
     prices = pd.read_parquet(cfg.paths.prices)
@@ -22,8 +20,7 @@ def _load_data(cfg):
 
     prices, feats = align_after_load(prices, feats)
 
-    # clamp to usable range and do **mask-based** split, same as train.py
-    # Shared utility returns strings, convert to Timestamps for comparison
+    # clamp to usable range and do mask-based split, same as train.py
     t_end_str, v_end_str, te_end_str = clamp_dates_to_index(feats.index, cfg.dates.train_end, cfg.dates.val_end, cfg.dates.test_end)
     t_end = pd.to_datetime(t_end_str)
     v_end = pd.to_datetime(v_end_str)
@@ -45,10 +42,6 @@ def _load_data(cfg):
     # also return the full (aligned) raw features so we can pass vol columns to cost model if needed
     return prices, feats, P_te, X_te
 
-def _make_env(P, X, env_cfg: EnvConfig, seed: int):
-    def _init():
-        return Monitor(PortfolioEnv(P, X, env_cfg))
-    return _init
 
 def _rollout(best_model, env):
     import numpy as np
@@ -65,7 +58,7 @@ def _rollout(best_model, env):
         # Always record reward as the per-step net return
         rets.append(float(np.asarray(reward).ravel()[0]))
 
-        # Record weights if your env exposes them
+        # Record weights if env exposes them
         if info and "weights" in info[0]:
             weights.append(np.asarray(info[0]["weights"], dtype=float))
 
@@ -78,14 +71,11 @@ def _rollout(best_model, env):
 
 def _metrics(rets: np.ndarray, weights_seq: list[np.ndarray]) -> dict:
     eq = (1.0 + rets).cumprod()
-    sharpe = float(np.sqrt(252.0) * rets.mean() / (rets.std() + 1e-12)) if len(rets)>1 else 0.0
-    mdd = float((eq / np.maximum.accumulate(eq) - 1.0).min()) if len(eq)>1 else 0.0
-    if len(weights_seq) >= 2:
-        W = np.vstack(weights_seq)
-        turnover = float(np.abs(np.diff(W, axis=0)).sum(axis=1).mean())
-    else:
-        turnover = 0.0
-    return {"sharpe": sharpe, "max_drawdown": mdd, "turnover": turnover}
+    return {
+        "sharpe": sharpe_ratio(rets),
+        "max_drawdown": max_drawdown(eq),  # Returns negative (e.g., -0.23 for -23%)
+        "turnover": turnover(weights_seq),
+    }
 
 def main():
     ap = argparse.ArgumentParser()
@@ -104,7 +94,7 @@ def main():
 
     # Load scaler from the run and transform TEST features
     from src.scaler import FitOnTrainScaler
-    # Scale TEST features with the **train-fitted** scaler from this run
+    # Scale TEST features with the train-fitted scaler from this run
     scaler = FitOnTrainScaler.load(scaler_path, columns=X_te.columns)
     X_tez = scaler.transform(X_te)
 
@@ -118,7 +108,7 @@ def main():
     best = PPO.load(str(best_zip))
 
     rows = []
-    # Sweep total *base* bps from 0 to 10 (inclusive)
+    # Sweep total *base* basis points from 0 to 10 (inclusive)
     for base_bps in range(0, 11):
         # Build EnvConfig: enable cost model with fee+slippage=0 and spread fixed at base_bps
         env_cfg = EnvConfig(
@@ -136,7 +126,7 @@ def main():
         )
 
         print(f"[env] P_te {P_te.shape}, X_tez {X_tez.shape}, equal index? {P_te.index.equals(X_tez.index)}")
-        env = DummyVecEnv([_make_env(P_te, X_tez, env_cfg, seed=cfg.seed + 100 + base_bps)])
+        env = DummyVecEnv([make_env(P_te, X_tez, env_cfg, seed=cfg.seed + 100 + base_bps)])
         rets, weights = _rollout(best, env)
         m = _metrics(rets, weights)
         rows.append({

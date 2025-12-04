@@ -10,6 +10,7 @@ import pandas as pd
 from src.scaler import FitOnTrainScaler
 from src.repro import set_global_seed
 from src.backtest import evaluate_sb3_model
+from src.utils.data_utils import align_dataframes
 from src.baselines import (
     CostCfg,
     vt_equal_weight,
@@ -54,17 +55,17 @@ def _filter_features(feats: pd.DataFrame, keep_pat: str) -> pd.DataFrame:
     if keep_pat in ("*", "", None):
         return feats
     pat = re.compile(keep_pat)
-    keep = [c for c in feats.columns if pat.search(c)]
+    # Handle MultiIndex columns: match against feature name (second level), not full tuple string
+    if isinstance(feats.columns, pd.MultiIndex):
+        # For MultiIndex, match against the feature name (level 1, second element of tuple)
+        keep = [c for c in feats.columns if pat.search(str(c[1]))]
+    else:
+        # For regular Index, match against column name as string
+        keep = [c for c in feats.columns if pat.search(str(c))]
     if not keep:
         raise ValueError(f"feature_keep='{keep_pat}' kept zero columns")
     return feats[keep]
 
-def _align(prices: pd.DataFrame, feats: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
-    feats = feats.dropna(how="any")
-    idx = prices.index.intersection(feats.index)
-    if len(idx) == 0:
-        raise ValueError("No common timestamps after dropna(features).")
-    return prices.loc[idx], feats.loc[idx]
 
 def _eval_rl(P: pd.DataFrame, Xz: pd.DataFrame, model_zip: Path) -> Dict[str, float]:
     res = evaluate_sb3_model(P, Xz, str(model_zip))
@@ -118,7 +119,7 @@ def _align_with_warmup(prices: pd.DataFrame, feats: pd.DataFrame, min_rows:int=2
     If the selected period has only NaNs in features, return (None, None, reason).
     Also clamps start to the first fully-valid feature row.
     """
-    # drop rows where ANY feature is NaN
+    # drop rows where any feature is NaN
     F2 = feats.dropna(how="any")
     if F2.empty:
         return None, None, "all features NaN in this slice (period too early for lookback)"
@@ -126,11 +127,14 @@ def _align_with_warmup(prices: pd.DataFrame, feats: pd.DataFrame, min_rows:int=2
     # clamp both to start at first_ok
     P2 = prices.loc[prices.index >= first_ok]
     F2 = F2.loc[F2.index >= first_ok]
-    # final inner join
-    idx = P2.index.intersection(F2.index)
-    if len(idx) < min_rows:
-        return None, None, f"only {len(idx)} usable rows after warm-up; need >= {min_rows}"
-    return P2.loc[idx], F2.loc[idx], None
+    # final inner join using unified alignment function
+    try:
+        P_aligned, F_aligned = align_dataframes(P2, F2, dropna=False, context="grid eval with warmup")
+        if len(P_aligned) < min_rows:
+            return None, None, f"only {len(P_aligned)} usable rows after warm-up; need >= {min_rows}"
+        return P_aligned, F_aligned, None
+    except ValueError:
+        return None, None, "no common timestamps after warm-up alignment"
 
 
 # main grid
@@ -158,7 +162,7 @@ def main():
     prices_all = pd.read_parquet(PROC / "prices_adj.parquet")
     feats_all  = pd.read_parquet(PROC / "features.parquet")
 
-    # Load scaler once before loops (optimization: avoid repeated I/O)
+    # Load scaler once before loops
     scaler = FitOnTrainScaler.load(scaler_path, columns=feats_all.columns)
     # determine scaler column names with several fallbacks
     scaler_cols = getattr(scaler, "columns_", None)
@@ -200,26 +204,43 @@ def main():
                     continue
                 P_s, F_s, _ = res2
 
-                # Transform features using pre-loaded scaler (optimization: scaler loaded once above)
-                # keep only selected feature columns for transform (intersection with scaler columns)
+                # For RL evaluation: use ALL features that the model was trained on
+                # For baselines: use filtered features (they don't care about feature count)
+                
+                # Get all features that match scaler columns (what model was trained on)
+                all_feat_cols = [c for c in F_up.columns if c in set(scaler_cols)]
+                if not all_feat_cols:
+                    # Fallback: use all available features if scaler columns don't match
+                    all_feat_cols = list(F_up.columns)
+                
+                # For RL: use full feature set aligned to current period
+                F_rl = F_up.loc[P_s.index, all_feat_cols] if len(all_feat_cols) > 0 else F_s
+                X_rl = scaler.transform(F_rl) if len(all_feat_cols) > 0 else scaler.transform(F_s)
+                
+                # For baselines: use filtered features (if different from RL)
+                # Transform filtered features using pre-loaded scaler
                 keep_cols = [c for c in F_s.columns if c in set(scaler_cols)]
-                X_s = F_s[keep_cols]
-                X_sz = scaler.transform(X_s)
+                X_s = F_s[keep_cols] if keep_cols else F_s
+                X_sz = scaler.transform(X_s) if keep_cols else F_s
 
                 # Align transformed features to prices (defensive)
-                common = P_s.index.intersection(X_sz.index)
-                P_s = P_s.loc[common]
-                X_sz = X_sz.loc[common]
+                P_rl, X_rl = align_dataframes(P_s, X_rl, dropna=False, context="RL eval alignment")
+                P_base, X_sz = align_dataframes(P_s, X_sz, dropna=False, context="baseline eval alignment")
 
-                # RL eval
+                # RL eval (use full feature set to match training observation space)
                 try:
-                    m_rl = _eval_rl(P_s, X_sz, model_zip)
+                    m_rl = _eval_rl(P_rl, X_rl, model_zip)
                     rows.append(dict(model="RL", universe=uname, period=pname, ablation=ab_name, **m_rl))
                 except Exception as e:
-                    rows.append(dict(model="RL", universe=uname, period=pname, ablation=ab_name, error=f"{type(e).__name__}: {e}"))
+                    error_msg = f"{type(e).__name__}: {e}"
+                    # Add diagnostic info for observation shape errors
+                    if "observation shape" in str(e).lower() or "unexpected" in str(e).lower():
+                        expected_dim = len(all_feat_cols) + len(P_rl.columns) + (1 if any("__CASH__" in str(c) for c in P_rl.columns) else 0)
+                        error_msg += f" (Expected {expected_dim} dims: {len(all_feat_cols)} features + {len(P_rl.columns)} assets, got {X_rl.shape[1]} features)"
+                    rows.append(dict(model="RL", universe=uname, period=pname, ablation=ab_name, error=error_msg))
 
-                # Baselines
-                base_rows = _eval_baselines(P_s, feats_raw=None, ab_cfg=ab, bl_cfg=grid.get("baselines", {}))
+                # Baselines (use filtered features - they don't need exact feature count)
+                base_rows = _eval_baselines(P_base, feats_raw=None, ab_cfg=ab, bl_cfg=grid.get("baselines", {}))
                 for br in base_rows:
                     rows.append(dict(universe=uname, period=pname, ablation=ab_name, **br))
 

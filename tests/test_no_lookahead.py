@@ -1,4 +1,3 @@
-# tests/test_no_lookahead.py
 import numpy as np
 import pandas as pd
 from src.env import PortfolioEnv, EnvConfig
@@ -14,5 +13,5 @@ def test_no_lookahead_rewards_use_previous_weights(tiny_market):
     # Now at step 1, pick something very different to try to "cheat"
     obs, r1, done, trunc, info1 = env.step(np.array([0.0, 1.0]))
 
-    expected = float(np.dot(info1["w_prev"], info1["r_t"]))  # MUST use previous weights
+    expected = float(np.dot(info1["w_prev"], info1["r_t"]))  # must use previous weights
     assert np.isclose(r1, expected, atol=1e-12)

@@ -14,10 +14,11 @@ import pandas as pd
 from stable_baselines3 import PPO
 from pathlib import Path
 
-# Local imports
 from src.scaler import FitOnTrainScaler
+from src.utils.data_utils import align_dataframes
+from src.utils.metrics import sharpe_ratio, max_drawdown, turnover
 
-# Baselines module (new)
+# Baselines module
 from src.baselines import (
     CostCfg,
     vt_equal_weight,
@@ -26,41 +27,11 @@ from src.baselines import (
     _run_backtest,  # engine to execute with costs
 )
 
-# --------------------------------------------------------------------------------------
-# Paths
-# --------------------------------------------------------------------------------------
 PROC = Path(__file__).resolve().parent.parent / "data" / "processed"
 ART  = Path(__file__).resolve().parent.parent / "artifacts"
 ART.mkdir(parents=True, exist_ok=True)
 
-# --------------------------------------------------------------------------------------
-# Metrics (legacy helpers used by simple loop + RL eval)
-# --------------------------------------------------------------------------------------
-def sharpe_ratio(returns: np.ndarray, freq: int = 252) -> float:
-    if returns.std() == 0:
-        return 0.0
-    return np.sqrt(freq) * returns.mean() / (returns.std() + 1e-12)
-
-def max_drawdown(equity_curve: np.ndarray) -> float:
-    peak = np.maximum.accumulate(equity_curve)
-    dd = (equity_curve - peak) / peak
-    return float(-dd.min()) if dd.size else 0.0
-
-def turnover(weights: np.ndarray) -> float:
-    if len(weights) < 2:
-        return 0.0
-    return float(np.abs(np.diff(weights, axis=0)).sum(axis=1).mean())
-
-# --------------------------------------------------------------------------------------
 # Simple backtest engine (for Buy&Hold / Equal-Weight baselines)
-# --------------------------------------------------------------------------------------
-def _align(prices: pd.DataFrame, features: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
-    """Inner-join on dates so we never index out of bounds."""
-    idx = prices.index.intersection(features.index)
-    if idx.empty:
-        raise ValueError("prices and features have disjoint indices; cannot backtest.")
-    return prices.loc[idx], features.loc[idx]
-
 def run_backtest(
     prices: pd.DataFrame,
     features: pd.DataFrame,
@@ -68,9 +39,9 @@ def run_backtest(
     start_value: float = 1.0,
 ) -> Dict[str, Any]:
     """
-    Simulate portfolio evolution using a policy function (no explicit cost model here).
+    Simulate portfolio evolution using a policy function
     """
-    prices, features = _align(prices, features)
+    prices, features = align_dataframes(prices, features, dropna=False, context="backtest")
     T, N = prices.shape
     rets_assets = prices.pct_change().fillna(0.0).to_numpy()  # (T, N)
 
@@ -107,15 +78,13 @@ def run_backtest(
     metrics = {
         "final_value": float(equity[-1]),
         "sharpe": sharpe_ratio(port_rets),
-        "max_drawdown": max_drawdown(equity),
+        "max_drawdown": max_drawdown(equity, return_positive=True),  # Return positive value for consistency
         "turnover": turnover(weights),
     }
 
     return {"equity_curve": equity, "weights": weights, "metrics": metrics}
 
-# --------------------------------------------------------------------------------------
 # Simple baselines (legacy): Buy & Hold, Equal Weight
-# --------------------------------------------------------------------------------------
 def buy_and_hold(prices: pd.DataFrame, features: pd.DataFrame) -> Dict[str, Any]:
     N = prices.shape[1]
     w0 = np.ones(N) / N
@@ -129,9 +98,7 @@ def equal_weight(prices: pd.DataFrame, features: pd.DataFrame) -> Dict[str, Any]
         return np.ones(N) / N  # rebalance daily to equal
     return run_backtest(prices, features, policy_fn)
 
-# --------------------------------------------------------------------------------------
-# Evaluate an SB3 PPO model in your custom env
-# --------------------------------------------------------------------------------------
+# Evaluate an SB3 PPO model in the custom env
 def evaluate_sb3_model(prices: pd.DataFrame, features: pd.DataFrame, model_path: str) -> Dict[str, Any]:
     from src.env import PortfolioEnv, EnvConfig
     env = PortfolioEnv(prices, features, EnvConfig())
@@ -171,14 +138,12 @@ def evaluate_sb3_model(prices: pd.DataFrame, features: pd.DataFrame, model_path:
     metrics = {
         "final_value": float(equity[-1]),
         "sharpe": sharpe_ratio(rets_port),
-        "max_drawdown": max_drawdown(equity),
+        "max_drawdown": max_drawdown(equity, return_positive=True),  # Return positive value for consistency
         "turnover": turnover(weights),
     }
     return {"equity_curve": equity, "weights": weights, "metrics": metrics}
 
-# --------------------------------------------------------------------------------------
-# Main / CLI
-# --------------------------------------------------------------------------------------
+# Main CLI entry point
 if __name__ == "__main__":
     import argparse, glob
 
@@ -200,7 +165,7 @@ if __name__ == "__main__":
 
     scaler_path = RUN / "scaler.json"
     best_model_path = RUN / "models" / "best" / "best_model.zip"
-    final_model_path = RUN / "models" / "ppo_dirichlet_sb3.zip"  # fallback if you saved here
+    final_model_path = RUN / "models" / "ppo_dirichlet_sb3.zip"  # fallback if saved here
 
     if not scaler_path.exists():
         raise FileNotFoundError(f"scaler.json not found at: {scaler_path}\n"
@@ -221,23 +186,19 @@ if __name__ == "__main__":
     feats   = feats.loc[idx]
     feats_z = feats_z.loc[idx]
 
-    # ---------------- Legacy baselines (no explicit costs here) ----------------
+    # ---------------- Legacy baselines ----------------
     bh = buy_and_hold(prices, feats_z)
     ew = equal_weight(prices, feats_z)
     print("Buy & Hold:", bh["metrics"])
     print("Equal Weight:", ew["metrics"])
 
-    # ---------------- RL Agent (if available) ---------------------------------
+    # ---------------- RL Agent ---------------------------------
     rl_zip = best_model_path if best_model_path.exists() else final_model_path
     try:
         rl = evaluate_sb3_model(prices, feats_z, str(rl_zip))
         print("RL Agent (SB3):", rl["metrics"])
     except Exception as e:
         print("RL Agent (SB3): skipped or failed ->", repr(e))
-
-    # =============================================================================
-    # NEW: Robust baselines with cost model (VT-EW, IVP, Momentum)
-    # =============================================================================
 
     # 1) Cost config.
     from src.baselines import CostCfg, vt_equal_weight, ivp_inverse_variance, momentum_xs, _run_backtest
@@ -251,8 +212,6 @@ if __name__ == "__main__":
         spread_vol_col_suffix="_s20",
     )
 
-    # If you want volatility-based spread and your RAW features include *_s20:
-    # features_for_cost = feats.loc[prices.index]
     features_for_cost = None
 
     # 2) Build targets for each baseline

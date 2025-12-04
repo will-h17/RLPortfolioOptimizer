@@ -4,6 +4,8 @@ from typing import Optional, Tuple, Dict, List
 import numpy as np
 import pandas as pd
 
+from src.utils.metrics import sharpe_ratio, max_drawdown, turnover
+
 
 # Cost model (fee + slippage + 1/2 spread)
 
@@ -54,29 +56,6 @@ def _per_asset_cost_bps(
     return fee + slp + 0.5 * spread_bps
 
 
-# Metrics helpers
-
-def _sharpe_daily(rets: np.ndarray) -> float:
-    if len(rets) < 2:
-        return 0.0
-    mu, sd = rets.mean(), rets.std()
-    return float(np.sqrt(252.0) * mu / (sd + 1e-12))
-
-def _max_drawdown(equity: np.ndarray) -> float:
-    if len(equity) < 2:
-        return 0.0
-    peak = np.maximum.accumulate(equity)
-    dd = equity / peak - 1.0
-    return float(dd.min())
-
-def _avg_turnover(weights_seq: List[np.ndarray]) -> float:
-    if len(weights_seq) < 2:
-        return 0.0
-    W = np.vstack(weights_seq)  # [T, N]
-    per_step = np.abs(np.diff(W, axis=0)).sum(axis=1)
-    return float(per_step.mean())
-
-
 # Rebalancing / engine utilities
 
 def _price_to_returns(prices: pd.DataFrame) -> pd.DataFrame:
@@ -114,7 +93,7 @@ def _run_backtest(
     T = len(dates)
     TW = target_weights.reindex(dates).ffill().fillna(0.0).to_numpy(dtype=np.float64)
 
-    # Preallocate arrays for better memory efficiency (optimization)
+    # Preallocate arrays for better memory efficiency
     n_assets = len(assets)
     rets = np.empty(T, dtype=np.float64)
     w_hist = np.empty((T, n_assets), dtype=np.float64)
@@ -145,9 +124,9 @@ def _run_backtest(
 
     equity = (1.0 + rets).cumprod()
     metrics = {
-        "sharpe": _sharpe_daily(rets),
-        "max_drawdown": _max_drawdown(equity),
-        "turnover": _avg_turnover([w_hist[i, :] for i in range(T)]),  # Convert to list of arrays for _avg_turnover
+        "sharpe": sharpe_ratio(rets),
+        "max_drawdown": max_drawdown(equity),  # Returns negative (e.g., -0.23 for -23%)
+        "turnover": turnover(w_hist),  # w_hist is already a 2D array [T, N]
         "num_steps": int(len(rets)),
     }
     return {
