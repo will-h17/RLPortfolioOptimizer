@@ -10,7 +10,7 @@ from src.paths import CONFIGS_DIR
 from webapp import jobs
 from webapp.components import card, dropdown, error, job_panel, page, register_job, table, training_configs
 
-dash.register_page(__name__, path="/train", name="⚙️ Training", title="Training", order=3)
+dash.register_page(__name__, path="/train", name="Training", title="Training", order=3)
 
 DEFAULT_CONFIG = "rlppo_v2.yaml"
 

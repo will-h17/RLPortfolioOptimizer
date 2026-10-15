@@ -8,7 +8,7 @@ from dash import State, html
 from webapp import jobs
 from webapp.components import card, dropdown, job_panel, page, register_job, table, training_configs
 
-dash.register_page(__name__, path="/hpo", name="🔍 Hyperparameters", title="Hyperparameter Search", order=8)
+dash.register_page(__name__, path="/hpo", name="Hyperparameters", title="Hyperparameter Search", order=8)
 
 
 def layout():

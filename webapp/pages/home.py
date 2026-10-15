@@ -5,12 +5,16 @@ from dash import html
 from src.paths import ARTIFACTS_DIR, FEATURES_PATH, PRICES_PATH
 from webapp.components import card, page, run_names
 
-dash.register_page(__name__, path="/", name="🏠 Dashboard", title="Dashboard", order=0)
+dash.register_page(__name__, path="/", name="Dashboard", title="Dashboard", order=0)
 
 
-def _stat(title: str, value: str, note: str) -> dbc.Col:
-    return dbc.Col(card(title, html.H3(value, className="text-center"),
+def _stat(title: str, value: str, note: str, color: str = "") -> dbc.Col:
+    return dbc.Col(card(title, html.H3(value, className=f"text-center {color}"),
                         html.P(note, className="text-center text-muted mb-0")), md=6, lg=3)
+
+
+def _status(title: str, ready: bool, note: str) -> dbc.Col:
+    return _stat(title, "Ready" if ready else "Missing", note, "text-success" if ready else "text-danger")
 
 
 def layout():
@@ -26,8 +30,8 @@ def layout():
     return page(
         "Dashboard", "Use the sidebar to move through the workflow.",
         dbc.Row([
-            _stat("Prices", "✅" if PRICES_PATH.exists() else "❌", PRICES_PATH.name),
-            _stat("Features", "✅" if FEATURES_PATH.exists() else "❌", FEATURES_PATH.name),
+            _status("Prices", PRICES_PATH.exists(), PRICES_PATH.name),
+            _status("Features", FEATURES_PATH.exists(), FEATURES_PATH.name),
             _stat("Completed runs", str(len(runs)), "with a saved model"),
             _stat("Walk-forward studies", str(len(studies)), "with a summary"),
         ]),

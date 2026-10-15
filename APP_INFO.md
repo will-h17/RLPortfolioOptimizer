@@ -45,18 +45,18 @@ Jobs belong to the browser tab that started them. Reloading the page detaches yo
 
 ## Pages
 
-### 🏠 Dashboard
+### Dashboard
 Shows whether prices and features exist, how many completed runs and walk-forward studies there are, the latest run, and links through the workflow.
 
-### 📥 Data
+### Data
 Enter ticker symbols (for example `SPY,QQQ,TLT`).
 1. **Download data** fetches daily adjusted prices from yfinance into `data/raw/`. Cached files are reused unless you tick "Re-download".
 2. **Process & merge** combines them into `data/processed/prices_adj.parquet`.
 
-### 🔧 Features
+### Features
 Enter lookback windows in days (default `5,20`) and generate `data/processed/features.parquet`: returns, momentum, volatility and trend features for every asset.
 
-### ⚙️ Training
+### Training
 Choose a config. The preview shows its run name, timesteps, parallel environments, episode setup, reward, costs and date split. If the config is invalid, the preview lists each invalid field instead.
 
 - `test_quick.yaml` takes a few seconds and only checks that the pipeline works.
@@ -64,29 +64,29 @@ Choose a config. The preview shows its run name, timesteps, parallel environment
 
 The result shows the run name and its test-split metrics.
 
-### 📊 Evaluation
+### Evaluation
 Backtests a run and the baselines over the full price history. That history includes the run's training period, so the agent's numbers here are in-sample. Use Walk-forward for a fair comparison.
 
-### 💰 Cost Sensitivity
+### Cost Sensitivity
 Re-runs a trained agent on its test split with bid-ask spreads from 0 to 10 bps, using the run's own config, and charts Sharpe against cost.
 
-### 🧭 Walk-forward
+### Walk-forward
 The result to trust. For each test year, it trains a fresh agent per seed on all earlier data, chooses the checkpoint on the preceding six months, and tests on that year. Equal weight, buy & hold and inverse variance are run on the same windows with identical costs.
 
 - **Results** shows any finished study: the full-period out-of-sample summary and a Sharpe-by-year chart.
 - **Run a study** starts one. A full study (10 years × 3 seeds with `rlppo_v2.yaml`) takes about 75 minutes. Set "Timesteps per run" to 50000 for a quick check.
 - Re-running with the same study name resumes it, skipping finished years and seeds.
 
-### 🌐 Grid Evaluation
+### Grid Evaluation
 Evaluates the latest run (or the one named in the grid config) across asset universes, periods and feature subsets.
 
-### 🔍 Hyperparameters
+### Hyperparameters
 Searches PPO and turnover-penalty settings with Optuna, scoring each trial by validation Sharpe. Each trial trains a model for `hpo.train_timesteps` steps, so a 30-trial search takes hours. Tick "Resume" to continue an existing study with the same name.
 
-### 📈 Reports
+### Reports
 Renders equity curves, metric comparisons and an allocation heatmap for a run (or the latest one) to `reports/`, and shows them on the page.
 
-### 📉 Performance
+### Performance
 Explores one run in detail:
 - its test-split Sharpe;
 - its equity curve against buy & hold and equal weight over the full history (in-sample, as on the Evaluation page);

@@ -7,7 +7,7 @@ from src.paths import ARTIFACTS_DIR
 from webapp import jobs
 from webapp.components import card, dropdown, job_panel, page, register_job, run_options, table
 
-dash.register_page(__name__, path="/evaluate", name="📊 Evaluation", title="Evaluation", order=4)
+dash.register_page(__name__, path="/evaluate", name="Evaluation", title="Evaluation", order=4)
 
 
 def layout():
