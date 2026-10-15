@@ -8,7 +8,7 @@ Provides standardized implementations of:
 """
 
 from __future__ import annotations
-from typing import List, Union
+
 import numpy as np
 
 
@@ -57,7 +57,7 @@ def max_drawdown(equity_curve: np.ndarray, return_positive: bool = False) -> flo
     return mdd
 
 
-def turnover(weights: Union[np.ndarray, List[np.ndarray]]) -> float:
+def turnover(weights: np.ndarray | list[np.ndarray]) -> float:
     """
     Calculate average portfolio turnover from weight changes.
     
@@ -86,3 +86,30 @@ def turnover(weights: Union[np.ndarray, List[np.ndarray]]) -> float:
     per_step = np.abs(np.diff(W, axis=0)).sum(axis=1)
     return float(per_step.mean())
 
+
+
+def cagr(returns: np.ndarray, freq: int = 252) -> float:
+    """Compound annual growth rate from per-period returns."""
+    returns = np.asarray(returns, dtype=float)
+    if len(returns) == 0:
+        return 0.0
+    growth = float(np.prod(1.0 + returns))
+    return growth ** (freq / len(returns)) - 1.0 if growth > 0 else -1.0
+
+
+def summarize_returns(returns: np.ndarray, trades: np.ndarray | None = None, freq: int = 252) -> dict:
+    """
+    Standard performance summary for a series of per-period net returns. `trades` is the L1 size of
+    each period's trade (info["turnover"] from the env); its mean is reported as turnover.
+    """
+    returns = np.asarray(returns, dtype=float)
+    equity = np.cumprod(1.0 + returns)
+    return {
+        "final_value": float(equity[-1]) if len(equity) else 1.0,
+        "cagr": cagr(returns, freq),
+        "ann_vol": float(returns.std() * np.sqrt(freq)) if len(returns) > 1 else 0.0,
+        "sharpe": sharpe_ratio(returns, freq),
+        "max_drawdown": max_drawdown(np.concatenate([[1.0], equity])),  # negative, from the starting value
+        "turnover": float(np.mean(trades)) if trades is not None and len(trades) else float("nan"),
+        "num_steps": int(len(returns)),
+    }

@@ -1,12 +1,17 @@
 from __future__ import annotations
-import os, sys, random, json, platform
+
+import os
+import platform
+import random
+import sys
+
 import numpy as np
 
 
 def set_global_seed(seed: int, deterministic: bool = True) -> None:
-    import os, random, numpy as np
     os.environ.setdefault("PYTHONHASHSEED", str(seed))
-    random.seed(seed); np.random.seed(seed)
+    random.seed(seed)
+    np.random.seed(seed)
     try:
         import torch as th
         th.manual_seed(seed)

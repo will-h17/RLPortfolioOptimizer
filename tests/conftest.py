@@ -1,18 +1,7 @@
-import sys, os
-from pathlib import Path
-
-ROOT = Path(__file__).resolve().parents[1]
-SRC  = ROOT / "src"
-
-# Put repo root and src/ at the front of sys.path
-if str(ROOT) not in sys.path:
-    sys.path.insert(0, str(ROOT))
-if str(SRC) not in sys.path:
-    sys.path.insert(0, str(SRC))
-    
 import numpy as np
 import pandas as pd
 import pytest
+
 
 @pytest.fixture
 def tiny_market():

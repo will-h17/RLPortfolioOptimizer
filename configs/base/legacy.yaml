@@ -1,0 +1,27 @@
+# Shared setup of the original rlppo* configs: reward shaping variants trained on one
+# full-history episode, 4096-step rollouts, a deeper network, and a volatility-scaled spread.
+extends: common.yaml
+
+reward:
+  return_weight: 1.0
+
+ppo:
+  gamma: 0.99
+  gae_lambda: 0.95
+  n_steps: 4096
+  batch_size: 512
+  clip_range: 0.2
+  policy_hidden_sizes: [256, 256, 128]
+
+train:
+  checkpoint_freq: 100000
+  eval_freq: 50000
+
+cost_model:
+  enabled: true
+  fee_bps: 0.0                   # explicit commissions/fees (per unit of notional turned over)
+  slippage_bps: 0.0              # residual price impact not captured by spread
+  spread:
+    type: "vol20"                # spread in bps = k_vol_to_bps x trailing 20-day daily volatility
+    fixed_bps: 2.0               # used only if type == "fixed"
+    k_vol_to_bps: 4000.0

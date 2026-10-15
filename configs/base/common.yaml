@@ -1,0 +1,20 @@
+# Settings shared by every training config. Configs inherit this with `extends: base/common.yaml`
+# and override only what differs. Not meant to be trained directly (it has no run_name).
+seed: 42
+paths:
+  prices: "data/processed/prices_adj.parquet"
+  features: "data/processed/features.parquet"
+  out_root: "artifacts"          # all run folders will live under here
+
+dates:                           # inclusive split end dates; walk_forward.py overrides these per fold
+  train_end: "2019-12-31"
+  val_end:   "2020-06-30"
+  test_end:  "2021-03-31"
+
+env:
+  include_cash: true
+  cash_rate_annual: 0.02         # simple annualized cash rate
+  normalize_obs_weights: true    # observe weights relative to equal weight (better learning stability)
+
+hpo:
+  train_timesteps: 300000

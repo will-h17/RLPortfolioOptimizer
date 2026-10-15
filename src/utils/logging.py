@@ -1,25 +1,17 @@
-from stable_baselines3.common.logger import configure
+"""
+logging.py — Training logger: SB3's stdout table plus a per-update progress.csv in the run folder
+(and TensorBoard event files when tensorboard is installed).
+"""
 
-# Make tensorboard optional (not required for core functionality)
-try:
-    from torch.utils.tensorboard import SummaryWriter
-    _TENSORBOARD_AVAILABLE = True
-except ImportError:
-    _TENSORBOARD_AVAILABLE = False
-    SummaryWriter = None  # type: ignore
+from __future__ import annotations
 
-def make_loggers(log_dir: str):
-    # SB3 logger (tensorboard output is optional)
-    log_outputs = ["stdout", "csv"]
-    if _TENSORBOARD_AVAILABLE:
-        log_outputs.append("tensorboard")
-    
-    sb3_logger = configure(log_dir, log_outputs)
-    
-    # for ad-hoc logging outside SB3 (optional)
-    if _TENSORBOARD_AVAILABLE:
-        tb = SummaryWriter(log_dir)
-    else:
-        tb = None  # Return None if tensorboard not available
-    
-    return sb3_logger, tb
+import importlib.util
+
+from stable_baselines3.common.logger import Logger, configure
+
+
+def make_logger(log_dir: str) -> Logger:
+    outputs = ["stdout", "csv"]
+    if importlib.util.find_spec("tensorboard") is not None:
+        outputs.append("tensorboard")
+    return configure(log_dir, outputs)

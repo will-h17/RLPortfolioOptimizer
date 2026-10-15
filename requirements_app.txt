@@ -1,5 +1,2 @@
-# Additional requirements for Dash web app
-dash>=2.14.0
-dash-bootstrap-components>=1.5.0
-plotly>=5.17.0
-
+# Pipeline + Dash web app. Dependencies are declared in pyproject.toml (extra: app).
+-e .[app]
