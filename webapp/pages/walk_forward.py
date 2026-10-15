@@ -10,7 +10,7 @@ from src.paths import ARTIFACTS_DIR
 from webapp import jobs
 from webapp.components import card, dropdown, job_panel, page, register_job, table, training_configs
 
-dash.register_page(__name__, path="/walk-forward", name="🧭 Walk-forward", title="Walk-forward", order=6)
+dash.register_page(__name__, path="/walk-forward", name="Walk-forward", title="Walk-forward", order=6)
 
 STUDIES_DIR = ARTIFACTS_DIR / "walk_forward"
 SUMMARY_COLUMNS = ["strategy", "folds", "seeds", "oos_sharpe", "oos_sharpe_seed_std", "oos_cagr", "oos_max_dd",

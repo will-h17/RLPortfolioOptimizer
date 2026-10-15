@@ -7,7 +7,7 @@ from dash import State, dcc, html
 from webapp import jobs
 from webapp.components import card, dropdown, job_panel, page, register_job, run_options, table
 
-dash.register_page(__name__, path="/costs", name="💰 Cost Sensitivity", title="Cost Sensitivity", order=5)
+dash.register_page(__name__, path="/costs", name="Cost Sensitivity", title="Cost Sensitivity", order=5)
 
 
 def layout():

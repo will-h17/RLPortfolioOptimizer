@@ -16,7 +16,7 @@ from src.scaler import FitOnTrainScaler
 from src.utils.data_utils import align_after_load
 from webapp.components import card, dropdown, page, run_names, run_options
 
-dash.register_page(__name__, path="/performance", name="📉 Performance", title="Performance", order=10)
+dash.register_page(__name__, path="/performance", name="Performance", title="Performance", order=10)
 
 
 def layout():

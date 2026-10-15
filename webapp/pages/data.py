@@ -6,7 +6,7 @@ from src.paths import PRICES_PATH
 from webapp import jobs
 from webapp.components import card, job_panel, page, register_job
 
-dash.register_page(__name__, path="/data", name="📥 Data", title="Data", order=1)
+dash.register_page(__name__, path="/data", name="Data", title="Data", order=1)
 
 
 def layout():

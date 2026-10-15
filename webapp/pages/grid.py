@@ -6,7 +6,7 @@ from dash import State, html
 from webapp import jobs
 from webapp.components import card, dropdown, grid_configs, job_panel, page, register_job, table
 
-dash.register_page(__name__, path="/grid", name="🌐 Grid Evaluation", title="Grid Evaluation", order=7)
+dash.register_page(__name__, path="/grid", name="Grid Evaluation", title="Grid Evaluation", order=7)
 
 
 def layout():

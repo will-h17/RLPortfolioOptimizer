@@ -6,7 +6,7 @@ from src.paths import REPORTS_DIR
 from webapp import jobs
 from webapp.components import card, dropdown, image, job_panel, page, register_job, run_options
 
-dash.register_page(__name__, path="/reports", name="📈 Reports", title="Reports", order=9)
+dash.register_page(__name__, path="/reports", name="Reports", title="Reports", order=9)
 
 
 def layout():

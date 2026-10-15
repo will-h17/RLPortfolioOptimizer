@@ -31,7 +31,7 @@ def navbar() -> dbc.Navbar:
     return dbc.Navbar(
         dbc.Container([
             html.Div([
-                html.H4("📈 RL Portfolio Optimizer", className="mb-0 text-white"),
+                html.H4("RL Portfolio Optimizer", className="mb-0 text-white"),
                 html.Small("Reinforcement-learning portfolio allocation", className="text-white-50"),
             ]),
         ], fluid=True),
