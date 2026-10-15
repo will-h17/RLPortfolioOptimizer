@@ -14,12 +14,14 @@ configuration and version information needed to recreate the exact conditions.
 """
 
 from __future__ import annotations
-from dataclasses import asdict
-from pathlib import Path
-from datetime import datetime
-import subprocess
-import shutil
+
 import json
+import shutil
+import subprocess
+from datetime import datetime
+from pathlib import Path
+
+from src.config_loader import AppCfg
 
 
 def _git_commit_hash() -> str | None:
@@ -36,14 +38,14 @@ def _git_commit_hash() -> str | None:
 
 
 class RunRecorder:
-    def __init__(self, run_name: str, out_root: str, cfg_obj) -> None:
+    def __init__(self, run_name: str, out_root: str, cfg_obj: AppCfg) -> None:
         """
         Initialize a new training run recorder.
         
         Args:
             run_name: Name identifier for this training run (e.g., "ppo_dirichlet_baseline")
             out_root: Root directory where run directories are created (typically "artifacts")
-            cfg_obj: Configuration object (dataclass) to save as JSON
+            cfg_obj: Validated configuration, saved as config.json
         """
         # Create timestamped directory name: YYYYMMDD-HHMMSS__run_name
         ts = datetime.now().strftime("%Y%m%d-%H%M%S")
@@ -61,7 +63,7 @@ class RunRecorder:
         # This ensures we can always see exactly what parameters were used
         cfg_json_path = self.run_dir / "config.json"
         with cfg_json_path.open("w") as f:
-            json.dump(asdict(cfg_obj), f, indent=2)
+            json.dump(cfg_obj.model_dump(), f, indent=2)
 
         # Record git commit hash for code version tracking
         # Helps identify which version of the codebase produced this run
@@ -113,3 +115,38 @@ class RunRecorder:
         dest = self.run_dir / dest_rel
         dest.parent.mkdir(parents=True, exist_ok=True)
         shutil.copy2(src, dest)
+
+
+def latest_run(artifacts_root: str | Path, run_name: str | None = None) -> Path:
+    """
+    Return the most recently modified run directory (named "<timestamp>__<run_name>") that has a
+    trained model. If run_name is given, only runs with that name are considered.
+    """
+    pattern = f"*__{run_name}" if run_name else "*__*"
+    runs = [p for p in Path(artifacts_root).glob(pattern) if p.is_dir() and has_model(p)]
+    if not runs:
+        raise FileNotFoundError(f"No completed runs matching '{pattern}' in {artifacts_root}. Train first: "
+                                f"python -m src.train --config configs/rlppo.yaml")
+    return max(runs, key=lambda p: p.stat().st_mtime)
+
+
+def resolve_run_model(run_dir: str | Path) -> Path:
+    """
+    Return the model to evaluate for a run: the EvalCallback best checkpoint, else the final model.
+    """
+    run_dir = Path(run_dir)
+    best = run_dir / "models" / "best" / "best_model.zip"
+    if best.exists():
+        return best
+    finals = sorted((run_dir / "models").glob("*_final.zip"))
+    if finals:
+        return finals[0]
+    raise FileNotFoundError(f"No best_model.zip or *_final.zip under {run_dir / 'models'}")
+
+
+def has_model(run_dir: Path) -> bool:
+    try:
+        resolve_run_model(run_dir)
+        return True
+    except FileNotFoundError:
+        return False

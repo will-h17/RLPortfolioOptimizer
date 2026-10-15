@@ -3,40 +3,31 @@ env.py — RL environment for portfolio optimization.
 
 State  : concat(features_t, current_portfolio_weights)
 Action : target weights (projected to the probability simplex: long-only, sum=1)
-Reward : log(1 + portfolio_return_{t->t+1}) - transaction_cost * L1(turnover)
+Reward : net = w_prev · r_{t->t+1} - cost(|w_new - w_drifted|); reward = net (or log(1+net)),
+         plus optional shaping terms. Holdings drift with prices between trades.
+
+info["ret"] is always the true net portfolio return (after costs, before shaping);
+use it, not the reward, for any performance metric.
 """
 
 from __future__ import annotations
-from dataclasses import dataclass
-from typing import Optional, Dict, Any, cast
+
+import json
+from dataclasses import asdict, dataclass, replace
+from dataclasses import fields as dataclass_fields
 from pathlib import Path
+from typing import Any
+
+import gymnasium as gym
 import numpy as np
 import pandas as pd
+from gymnasium import spaces
+from stable_baselines3.common.monitor import Monitor
 
-try:
-    from stable_baselines3.common.monitor import Monitor
-except ImportError:
-    # Fallback for environments without SB3 installed
-    Monitor = lambda x: x  # no-op wrapper
+from src.paths import FEATURES_PATH, PRICES_PATH
 
-# Paths
-SRC_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SRC_DIR.parent
-PROC_DIR = PROJECT_ROOT / "data" / "processed"
-
-# Gymnasium imports
-try:
-    import gymnasium as gym
-    from gymnasium import spaces
-    _GYM = True
-except Exception:
-    _GYM = False
-
-    class _Box:
-        def __init__(self, low, high, shape, dtype): self.low, self.high, self.shape, self.dtype = low, high, shape, dtype
-    class _Env: pass
-    spaces = type("spaces", (), {"Box": _Box})
-    gym = type("gym", (), {"Env": _Env})
+# Rolling window (days) for the "vol20" spread model
+SPREAD_VOL_WINDOW = 20
 
 
 def _project_to_simplex(x: np.ndarray) -> np.ndarray:
@@ -62,11 +53,12 @@ class EnvConfig:
     cash_rate_annual: float = 0.0
     seed: int = 0
 
-    start: Optional[int] = None   # starting row index within provided data
-    end: Optional[int] = None     # ending row index (inclusive or exclusive per your env)
-    max_steps: Optional[int] = None  # cap episode length we you want
+    start: int | None = None   # first row index within provided data
+    end: int | None = None     # last row index whose forward return is used (inclusive)
+    max_steps: int | None = None  # episode length cap (steps); None = run to the end of the data
+    random_start: bool = False    # sample each episode's start uniformly (training only; needs max_steps)
 
-    # Reward definition: "arith" (default) or "log"
+    # Reward definition: "arith" (net return, default) or "log" (log(1 + net return))
     reward_mode: str = "arith"
     return_weight: float = 1.0  # <-- MUST be +1.0
     turnover_penalty: float = 0.0
@@ -80,6 +72,8 @@ class EnvConfig:
     spread_type: str = "fixed"     # "fixed" or "vol20"
     spread_fixed_bps: float = 0.0
     spread_k_vol_to_bps: float = 8000.0
+    # Deprecated: vol20 is now computed from raw prices inside the env, because the
+    # feature matrix the env receives is z-scored and cannot be used as a volatility.
     spread_vol_col_suffix: str = "_s20"
 
     # Observation normalization (optional, for RL training stability)
@@ -100,16 +94,81 @@ class EnvConfig:
         # 252 trading days; adjust we want to use calendar days
         return float(self.cash_rate_annual) / 252.0
 
+    def for_evaluation(self) -> EnvConfig:
+        """Same env, but one deterministic episode over the whole data (no random windows)."""
+        return replace(self, random_start=False, max_steps=None)
+
+    def save(self, path: str | Path) -> None:
+        Path(path).write_text(json.dumps(asdict(self), indent=2))
+
+    @classmethod
+    def load(cls, path: str | Path) -> EnvConfig:
+        return cls(**json.loads(Path(path).read_text()))
+
+
+def build_env_config(cfg) -> EnvConfig:
+    """Translate an AppCfg (see config_loader.py) into the EnvConfig used by the environment."""
+    spread = cfg.cost_model.spread
+    candidates = {
+        "transaction_cost": cfg.env.transaction_cost_bps / 10_000.0,  # bps -> proportion
+        "include_cash": cfg.env.include_cash,
+        "cash_rate_annual": cfg.env.cash_rate_annual,
+        "normalize_obs_weights": cfg.env.normalize_obs_weights,
+        "reward_mode": cfg.env.reward_mode,
+        "random_start": cfg.env.random_start,
+        "max_steps": cfg.env.episode_length,
+
+        # Advanced reward shaping for profitability
+        "reward_vol_scaling": cfg.env.reward_vol_scaling,
+        "reward_sharpe_bonus": cfg.env.reward_sharpe_bonus,
+        "reward_vol_window": cfg.env.reward_vol_window,
+        "reward_return_bonus": cfg.env.reward_return_bonus,
+        "reward_return_threshold": cfg.env.reward_return_threshold,
+        "reward_compound_bonus": cfg.env.reward_compound_bonus,
+
+        "return_weight": cfg.reward.return_weight,
+        "turnover_penalty": cfg.reward.turnover_penalty,
+        "drawdown_penalty": cfg.reward.drawdown_penalty,
+        "volatility_penalty": cfg.reward.volatility_penalty,
+
+        "cost_enabled": cfg.cost_model.enabled,
+        "fee_bps": cfg.cost_model.fee_bps,
+        "slippage_bps": cfg.cost_model.slippage_bps,
+        "spread_type": spread.type,
+        "spread_fixed_bps": spread.fixed_bps,
+        "spread_k_vol_to_bps": spread.k_vol_to_bps,
+        "spread_vol_col_suffix": spread.vol_col_suffix,
+
+        "seed": cfg.seed,
+    }
+    allowed = {f.name for f in dataclass_fields(EnvConfig)}
+    return EnvConfig(**{k: v for k, v in candidates.items() if k in allowed})
+
+
+def load_run_env_config(run_dir: str | Path) -> EnvConfig:
+    """
+    Return the EnvConfig a run was trained with, so evaluation uses the same env.
+    New runs store env_config.json; older runs are rebuilt from their config.json.
+    """
+    run_dir = Path(run_dir)
+    env_json = run_dir / "env_config.json"
+    if env_json.exists():
+        return EnvConfig.load(env_json)
+    cfg_json = run_dir / "config.json"
+    if cfg_json.exists():
+        from src.config_loader import load_config
+        return build_env_config(load_config(cfg_json))
+    raise FileNotFoundError(f"No env_config.json or config.json in {run_dir}")
+
 
 class PortfolioEnv(gym.Env):
-    metadata = {"render.modes": ["human"]}
+    metadata = {"render_modes": ["human"]}
 
-    def __init__(self, prices: pd.DataFrame, features: pd.DataFrame, config: Optional[EnvConfig] = None) -> None:
+    def __init__(self, prices: pd.DataFrame, features: pd.DataFrame, config: EnvConfig | None = None) -> None:
         super().__init__()
         self.cfg = config or EnvConfig()
         self.config = self.cfg
-        self.rng = np.random.default_rng(self.cfg.seed)
-        
+
         # Validate inputs
         if not isinstance(prices.index, pd.DatetimeIndex):
             raise ValueError("prices index must be DatetimeIndex.")
@@ -151,30 +210,30 @@ class PortfolioEnv(gym.Env):
         self._features_array = self.features.to_numpy(dtype=np.float32)
         self._n_features = self._features_array.shape[1]
 
-        # Precompute vol column indices if using vol20 spread (optimization: avoid repeated lookups)
-        self._vol_col_indices = None
-        if self.cfg.cost_enabled and getattr(self.cfg, "spread_type", "fixed") == "vol20":
-            suffix = str(getattr(self.cfg, "spread_vol_col_suffix", "_s20"))
-            vol_cols = [f"{c}{suffix}" for c in self.assets]
-            if all(col in self.features.columns for col in vol_cols):
-                try:
-                    self._vol_col_indices = [self.features.columns.get_loc(c) for c in vol_cols]
-                except (KeyError, IndexError):
-                    # MultiIndex or other edge case - will use fallback in _per_asset_cost_bps
-                    self._vol_col_indices = None
+        # Precompute trailing 20d daily vol of each asset from raw prices for the vol20 spread model.
+        # Row t uses returns up to and including day t (known when trading at t's close); the
+        # first two rows have no estimate yet and are backfilled. Cash has a constant price,
+        # so its vol (and spread) is 0.
+        self._vol20 = None
+        if self.cfg.cost_enabled and self.cfg.spread_type == "vol20":
+            vol = self.prices.pct_change().rolling(SPREAD_VOL_WINDOW, min_periods=2).std()
+            self._vol20 = vol.bfill().fillna(0.0).to_numpy(dtype=np.float64)
 
         # Episode bounds
         T = len(self.prices)
-        start_val = getattr(self.cfg, "start", None)
-        end_val = getattr(self.cfg, "end", None)
-        self._start = 0 if start_val is None else int(cast(int, start_val))
-        self._end = (T - 2) if end_val is None else int(cast(int, end_val))
+        self._start = 0 if self.cfg.start is None else int(self.cfg.start)
+        self._end = (T - 2) if self.cfg.end is None else int(self.cfg.end)
         if not (0 <= self._start <= self._end <= T - 2):
             raise ValueError(f"Invalid (start,end)=({self._start},{self._end}) for T={T}")
+        if self.cfg.reward_mode not in ("arith", "log"):
+            raise ValueError(f"Unknown reward_mode={self.cfg.reward_mode!r}")
+        if self.cfg.random_start and not self.cfg.max_steps:
+            raise ValueError("random_start requires max_steps (the episode length)")
 
-        # Convention: first reward uses return from (t-1 -> t), so start at t=1
+        # Convention: start at t=1 so the first observation has a prior row of history
         self._t0 = max(self._start + 1, 1)
         self.t = self._t0  # Use self.t consistently (not self._t)
+        self._episode_end = self._end  # last t of the current episode (set in reset)
 
         # Start equal-weight
         self._w = np.ones(self.n_assets, dtype=np.float32) / self.n_assets
@@ -188,18 +247,19 @@ class PortfolioEnv(gym.Env):
 
         # Observation and action spaces
         obs_dim = self._n_features + self.n_assets
-        self.observation_space = cast(Any, spaces).Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
-        self.action_space = cast(Any, spaces).Box(low=0.0, high=1.0, shape=(self.n_assets,), dtype=np.float32)
+        self.observation_space = spaces.Box(-np.inf, np.inf, shape=(obs_dim,), dtype=np.float32)
+        self.action_space = spaces.Box(low=0.0, high=1.0, shape=(self.n_assets,), dtype=np.float32)
 
-    def reset(self, *, seed: Optional[int] = None, options: Optional[Dict[str, Any]] = None):
-        if seed is not None:
-            try:
-                import random
-                np.random.seed(seed)
-                random.seed(seed)
-            except Exception:
-                pass
-        self.t = self._t0
+    def reset(self, *, seed: int | None = None, options: dict[str, Any] | None = None):
+        super().reset(seed=seed)
+        n_steps = self.cfg.max_steps
+        if self.cfg.random_start:
+            assert n_steps is not None  # checked in __init__
+            latest_start = max(self._t0, self._end - n_steps + 1)
+            self.t = int(self.np_random.integers(self._t0, latest_start + 1))
+        else:
+            self.t = self._t0
+        self._episode_end = self._end if n_steps is None else min(self._end, self.t + n_steps - 1)
         self._w = np.ones(self.n_assets, dtype=float) / self.n_assets
         self._value = 1.0
         self._portfolio_returns = []  # Reset return history
@@ -211,47 +271,42 @@ class PortfolioEnv(gym.Env):
     def step(self, action):
         """
         One-step transition with leak-free accounting:
-        - Reward for period t uses returns r_t from (t-1 -> t) and the *previous* weights w_prev.
-        - Trading to new weights w_new happens *now*; the cost is charged this step.
-        - New weights become the holdings for the *next* period (t+1).
+        - Step t earns r_t = P[t+1]/P[t] - 1 on the *previous* weights w_prev, which were
+          chosen before observing features[t].
+        - Holdings then drift with prices; trading from the drifted weights to the new
+          target w_new costs |w_new - w_drift| (so holding a constant mix is not free).
+        - New weights become the holdings for the *next* step.
+        Reaching the end of the episode is a time limit, so it is reported as truncated.
         """
-        # ---- indices / guards ----
-        # self.t should point to the current period end (so r_t = returns at self.t)
-        # After reset(), set self.t = 1 (so first reward uses R[1] = return from day0->day1).
         if self.done:
-            return self._obs(), 0.0, True, False, {}
+            return self._obs(), 0.0, False, True, {}
 
         # Previous weights and this period's asset returns (arith)
         # Use views instead of copies for performance (only copy when needed for info dict)
         w_prev = self._w
         r_t = self._rets[self.t, :]
 
-        # Gross portfolio return for this step
-        mode = getattr(self.config, "reward_mode", "arith")
-        if mode == "arith":
-            ret_gross = float(np.dot(w_prev, r_t))
-        elif mode == "log":
-            ret_gross = float(np.log1p(np.dot(w_prev, r_t)))
-        else:
-            raise ValueError(f"Unknown reward_mode={mode!r}")
+        # Gross portfolio return for this step, then let holdings drift with prices
+        ret_gross = float(np.dot(w_prev, r_t))
+        w_drift = w_prev * (1.0 + r_t) / (1.0 + ret_gross)
 
         # Project action to simplex of length n_assets
         a = np.asarray(action, dtype=float).ravel()
-        w_target = _project_to_simplex(a)
-        w_new = w_target
+        w_new = _project_to_simplex(a)
 
-        # Turnover & cost (only when weights change)
-        dw = np.abs(w_new - w_prev)
+        # Turnover & cost (only when trading); per-asset bps from the cost model,
+        # or the flat transaction_cost when the cost model is disabled
+        dw = np.abs(w_new - w_drift)
         turnover = float(dw.sum())
-        tc = float(getattr(self.config, "transaction_cost", 0.0))
-        cost = tc * turnover if turnover > 1e-12 else 0.0
-        base = ret_gross - cost
+        cost = float(np.dot(self._per_asset_cost_bps(self.t), dw)) / 10_000.0 if turnover > 1e-12 else 0.0
+        net = ret_gross - cost  # arithmetic net return: what the portfolio actually earned
+        base = float(np.log1p(net)) if self.cfg.reward_mode == "log" else net
         rw   = float(getattr(self.config, "return_weight", 1.0))
         pen_turn = float(getattr(self.config, "turnover_penalty", 0.0)) * turnover
-        
+
         # Track portfolio return for volatility/Sharpe calculations
-        self._portfolio_returns.append(base)
-        
+        self._portfolio_returns.append(net)
+
         # Advanced reward shaping for profitability
         reward = rw * base - pen_turn
         
@@ -313,25 +368,36 @@ class PortfolioEnv(gym.Env):
         # Advance state
         self._w = w_new
         self.t += 1
-        self.done = self.t >= self._end
+        self.done = self.t > self._episode_end  # last step uses _rets[_episode_end]
 
         obs = self._obs()
         # Update portfolio value for tracking
-        self._value = self._value * (1.0 + base)
+        self._value = self._value * (1.0 + net)
         
         # Only copy arrays that are returned in info (to avoid reference issues)
         info = {
             "weights": w_new.copy(),  # New weights, copy for safety
             "prev_weights": w_prev.copy(),  # Previous weights, copy for safety
             "w_prev": w_prev.copy(),   # alias expected by tests
+            "w_drift": w_drift.copy(),  # holdings just before trading
             "r_t": r_t.copy(),  # Returns, copy for safety
             "ret_gross": float(ret_gross),
             "cost": float(cost),
-            "ret_net": float(reward),
+            "ret": float(net),         # true net return (after costs, before reward shaping)
+            "ret_net": float(net),     # alias of "ret"
+            "reward": float(reward),   # shaped reward the agent was trained on
             "turnover": float(turnover),
             "value": float(self._value),  # Current portfolio value
         }
-        return obs, reward, self.done, False, info
+        return obs, reward, False, self.done, info
+
+    def drifted_weights(self) -> np.ndarray:
+        """
+        Holdings after this step's price move, i.e. the target that means "don't trade".
+        For passive baselines (buy & hold, hold between rebalances); it is not an observation.
+        """
+        r_t = self._rets[self.t]
+        return self._w * (1.0 + r_t) / (1.0 + float(np.dot(self._w, r_t)))
 
     def _obs(self) -> np.ndarray:
         # Use precomputed numpy array instead of DataFrame.iloc for ~10x speedup
@@ -372,32 +438,18 @@ class PortfolioEnv(gym.Env):
 
         # SPREAD: either fixed or proportional to 20d daily vol
         spread_bps = np.full(n, float(getattr(cfg, "spread_fixed_bps", 0.0)), dtype=np.float64)
-        if getattr(cfg, "spread_type", "fixed") == "vol20":
-            # Use precomputed vol column indices if available (optimization)
-            if self._vol_col_indices is not None:
-                vol = self._features_array[t, self._vol_col_indices].astype(np.float64)
-            else:
-                # Fallback: compute indices on-the-fly or use DataFrame
-                suffix = str(getattr(cfg, "spread_vol_col_suffix", "_s20"))
-                vol_cols = [f"{c}{suffix}" for c in self.assets]
-                if all(col in self.features.columns for col in vol_cols):
-                    try:
-                        col_indices = [self.features.columns.get_loc(c) for c in vol_cols]
-                        vol = self._features_array[t, col_indices].astype(np.float64)
-                    except (KeyError, IndexError):
-                        # Fallback to DataFrame if column lookup fails (e.g., MultiIndex)
-                        vol = self.features.iloc[t][vol_cols].to_numpy(dtype=np.float64)
-                else:
-                    vol = np.zeros(n, dtype=np.float64)
-            k = float(getattr(cfg, "spread_k_vol_to_bps", 8000.0))
-            spread_bps = k * vol  # convert vol to bps via a scalar
+        if cfg.spread_type == "vol20":
+            assert self._vol20 is not None  # computed in __init__ whenever the vol20 model is enabled
+            spread_bps = float(cfg.spread_k_vol_to_bps) * self._vol20[t]  # daily vol -> bps
+        elif cfg.spread_type != "fixed":
+            raise ValueError(f"Unknown spread_type={cfg.spread_type!r}")
 
         # crossing half-spread once + fee + slippage
         per_asset_bps = fee + slp + 0.5 * spread_bps
         return per_asset_bps
 
 
-def make_env(prices=None, features=None, env_cfg: Optional[EnvConfig] = None, seed: int = 0):
+def make_env(prices=None, features=None, env_cfg: EnvConfig | None = None, seed: int = 0):
     """
     Factory function that returns an environment initializer callable.
     
@@ -428,18 +480,10 @@ def make_env(prices=None, features=None, env_cfg: Optional[EnvConfig] = None, se
                 "called with missing or None arguments."
             )
         env = PortfolioEnv(prices=prices, features=features, config=env_cfg)
-        
-        # Set seed on environment if supported
-        if hasattr(env, "seed"):
-            env.seed(seed)
-        
-        # Gymnasium-style seed setting
-        try:
-            env.action_space.seed(seed)
-            env.observation_space.seed(seed)
-        except Exception:
-            pass  # Ignore if not supported
-        
+        # Episode randomness is seeded through reset(seed=...) by the VecEnv; seed the spaces too
+        env.action_space.seed(seed)
+        env.observation_space.seed(seed)
+
         return Monitor(env)
     
     return _init
@@ -447,11 +491,10 @@ def make_env(prices=None, features=None, env_cfg: Optional[EnvConfig] = None, se
 
 # self-test 
 if __name__ == "__main__":
-    prices_path = PROC_DIR / "prices_adj.parquet"
-    feats_path = PROC_DIR / "features.parquet"
+    prices_path, feats_path = PRICES_PATH, FEATURES_PATH
     if not (prices_path.exists() and feats_path.exists()):
         raise SystemExit(
-            f"Missing processed files.\nExpected:\n  {prices_path}\n  {feats_path}\nRun src/data.py then src/features.py."
+            f"Missing processed files.\nExpected:\n  {prices_path}\n  {feats_path}\nRun: python -m src.data && python -m src.features"
         )
     prices = pd.read_parquet(prices_path)
     feats = pd.read_parquet(feats_path)
@@ -461,5 +504,5 @@ if __name__ == "__main__":
         a = np.random.randn(env.n_assets)
         obs, r, done, trunc, info = env.step(a)
         env.render()
-        if done: break
+        if done or trunc: break
     print("Final value:", env._value)

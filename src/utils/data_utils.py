@@ -1,9 +1,14 @@
 """
-Data alignment and date utilities
+Data alignment, date splitting, and dataset preparation utilities
 """
 from __future__ import annotations
-from typing import Tuple, Optional
+
+from dataclasses import dataclass
+from typing import cast
+
 import pandas as pd
+
+from src.paths import resolve
 
 
 def align_dataframes(
@@ -11,9 +16,9 @@ def align_dataframes(
     feats: pd.DataFrame,
     dropna: bool = True,
     verbose: bool = False,
-    context: Optional[str] = None,
+    context: str | None = None,
     show_trimming: bool = False
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     Align prices and features DataFrames on common timestamps.
     
@@ -62,12 +67,13 @@ def align_dataframes(
     
     # Print verbose information if requested
     if verbose and len(common) > 0:
-        print(f"[data] usable rows: {len(common)} from {common.min().date()} to {common.max().date()}")
+        print(f"[data] usable rows: {len(common)} from {cast(pd.Timestamp, common.min()).date()} to "
+              f"{cast(pd.Timestamp, common.max()).date()}")
     
     return prices_aligned, feats_aligned
 
 
-def align_after_load(prices: pd.DataFrame, feats: pd.DataFrame) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def align_after_load(prices: pd.DataFrame, feats: pd.DataFrame) -> tuple[pd.DataFrame, pd.DataFrame]:
     """
     1) Drop rows in features that are not fully ready (NaNs from rolling/shift).
     2) Intersect indices and return aligned (prices, feats) on the common dates.
@@ -77,121 +83,83 @@ def align_after_load(prices: pd.DataFrame, feats: pd.DataFrame) -> Tuple[pd.Data
     return align_dataframes(prices, feats, dropna=True, verbose=True)
 
 
-def clamp_dates_to_index(
-    idx: pd.DatetimeIndex, 
-    train_end: str, 
-    val_end: str, 
-    test_end: str
-) -> Tuple[str, str, str]:
-    """
-    Clamp date strings to live within idx[min..max] and enforce ordering train_end <= val_end <= test_end.
-    Returns ISO strings to be passed to date_slices.
-    """
-    idx = pd.to_datetime(idx).tz_localize(None)
-    idx = pd.DatetimeIndex(idx.unique()).sort_values()
+# Rows dropped from the start of the aligned data before splitting. Features are already
+# NaN-free after align_after_load; this extra burn-in is kept so splits match earlier runs.
+MAX_LOOKBACK = 60  # days
+WARMUP = MAX_LOOKBACK + 1
 
+
+@dataclass
+class DatasetSplits:
+    """Aligned prices/features for the whole usable range and each date split (raw, unscaled features)."""
+    prices: pd.DataFrame
+    feats: pd.DataFrame
+    train: tuple[pd.DataFrame, pd.DataFrame]
+    val: tuple[pd.DataFrame, pd.DataFrame]
+    test: tuple[pd.DataFrame, pd.DataFrame]
+
+
+def validate_split_dates(
+    idx: pd.DatetimeIndex,
+    train_end: str,
+    val_end: str,
+    test_end: str,
+) -> tuple[pd.Timestamp, pd.Timestamp, pd.Timestamp]:
+    """
+    Parse split end dates and check they are ordered and leave every split non-empty.
+    Raises ValueError with the data range instead of silently adjusting the split.
+    """
     if len(idx) == 0:
-        raise ValueError("Cannot clamp dates: index is empty")
-    
-    dmin, dmax = idx.min().normalize(), idx.max().normalize()
+        raise ValueError("Cannot split: index is empty")
+    t_end, v_end, te_end = (cast(pd.Timestamp, pd.Timestamp(d)) for d in (train_end, val_end, test_end))
+    first, last = cast(pd.Timestamp, idx.min()), cast(pd.Timestamp, idx.max())
+    if not (t_end < v_end < te_end):
+        raise ValueError(f"Split dates must satisfy train_end < val_end < test_end; "
+                         f"got {t_end.date()}, {v_end.date()}, {te_end.date()}")
 
-    t_end = pd.to_datetime(train_end).normalize()
-    v_end = pd.to_datetime(val_end).normalize()
-    te_end = pd.to_datetime(test_end).normalize()
+    counts = {
+        "train": int((idx <= t_end).sum()),
+        "val": int(((idx > t_end) & (idx <= v_end)).sum()),
+        "test": int(((idx > v_end) & (idx <= te_end)).sum()),
+    }
+    empty = [name for name, n in counts.items() if n == 0]
+    if empty:
+        raise ValueError(f"Empty {', '.join(empty)} split for dates train_end={t_end.date()}, "
+                         f"val_end={v_end.date()}, test_end={te_end.date()}; "
+                         f"usable data spans {first.date()} to {last.date()}")
+    if te_end > last:
+        print(f"[dates] note: test_end={te_end.date()} is after the last data row ({last.date()})")
+    return t_end, v_end, te_end
 
-    # clamp into bounds
-    t_end = min(max(t_end, dmin), dmax)
-    v_end = min(max(v_end, dmin), dmax)
-    te_end = min(max(te_end, dmin), dmax)
 
-    # enforce nondecreasing order; fallback if needed
-    if not (t_end <= v_end <= te_end):
-        n = len(idx)
-        if n < 3:
-            raise ValueError(f"Not enough data points ({n}) for train/val/test split. Need at least 3 rows.")
-        i_tr = max(1, min(int(0.70 * n) - 1, n - 3))  # Ensure valid index
-        i_va = max(i_tr + 1, min(int(0.85 * n) - 1, n - 2))  # Ensure valid index
-        i_te = n - 1  # Use last index
-        
-        # Get dates from index with bounds checking and NaT handling
-        if 0 <= i_tr < len(idx):
-            t_end = idx[i_tr]
-            if pd.notna(t_end):
-                t_end = t_end.normalize()
-            else:
-                t_end = dmin
-        else:
-            t_end = dmin
-            
-        if 0 <= i_va < len(idx):
-            v_end = idx[i_va]
-            if pd.notna(v_end):
-                v_end = v_end.normalize()
-            else:
-                v_end = idx[min(i_tr + 1, n - 1)].normalize() if i_tr + 1 < n else dmax
-        else:
-            v_end = idx[min(i_tr + 1, n - 1)].normalize() if i_tr + 1 < n else dmax
-            
-        if 0 <= i_te < len(idx):
-            te_end = idx[i_te]
-            if pd.notna(te_end):
-                te_end = te_end.normalize()
-            else:
-                te_end = dmax
-        else:
-            te_end = dmax
+def prepare_dataset(cfg) -> DatasetSplits:
+    """
+    Load processed prices/features from cfg.paths, drop the warm-up rows, align them, and split
+    by cfg.dates (inclusive end dates). Used by training, HPO and the cost sweep so all of
+    them see exactly the same rows.
+    """
+    prices = pd.read_parquet(resolve(cfg.paths.prices))
+    feats = pd.read_parquet(resolve(cfg.paths.features))
+    for name, df in (("prices", prices), ("features", feats)):
+        if df.index.isna().any():
+            raise ValueError(f"{name} has {int(df.index.isna().sum())} row(s) without a date. Rebuild the "
+                             f"processed data: python -m src.data && python -m src.features")
+        if not (df.index.is_monotonic_increasing and df.index.is_unique):
+            raise ValueError(f"{name} index must be sorted and unique")
 
-    # use searchsorted (works on sorted index)
-    i_tr_end = int(idx.searchsorted(t_end, side="left"))
-    i_va_end = int(idx.searchsorted(v_end, side="left"))
-    i_te_end = int(idx.searchsorted(te_end, side="left"))
+    prices, feats = align_after_load(prices, feats)
+    prices, feats = prices.iloc[WARMUP:], feats.iloc[WARMUP:]
 
-    # ensure segments are non-empty; fallback if necessary
-    if not (0 <= i_tr_end < len(idx) and i_tr_end < i_va_end < i_te_end <= len(idx)):
-        n = len(idx)
-        if n < 3:
-            raise ValueError(f"Not enough data points ({n}) for train/val/test split. Need at least 3 rows.")
-        i_tr = max(1, min(int(0.70 * n) - 1, n - 3))  # Ensure valid index
-        i_va = max(i_tr + 1, min(int(0.85 * n) - 1, n - 2))  # Ensure valid index
-        i_te = n - 1  # Use last index
-        
-        # Safely get dates from index with bounds checking and NaT handling
-        if 0 <= i_tr < len(idx):
-            t_end_val = idx[i_tr]
-            t_end = t_end_val.normalize() if pd.notna(t_end_val) else dmin
-        else:
-            t_end = dmin
-            
-        if 0 <= i_va < len(idx):
-            v_end_val = idx[i_va]
-            v_end = v_end_val.normalize() if pd.notna(v_end_val) else idx[min(i_tr + 1, n - 1)].normalize()
-        else:
-            v_end = idx[min(i_tr + 1, n - 1)].normalize() if i_tr + 1 < n else dmax
-            
-        if 0 <= i_te < len(idx):
-            te_end_val = idx[i_te]
-            te_end = te_end_val.normalize() if pd.notna(te_end_val) else dmax
-        else:
-            te_end = dmax
+    idx = pd.DatetimeIndex(prices.index)
+    t_end, v_end, te_end = validate_split_dates(idx, cfg.dates.train_end, cfg.dates.val_end, cfg.dates.test_end)
+    masks = {
+        "train": idx <= t_end,
+        "val": (idx > t_end) & (idx <= v_end),
+        "test": (idx > v_end) & (idx <= te_end),
+    }
+    splits = {name: (prices.loc[m], feats.loc[m]) for name, m in masks.items()}
 
-    # Final validation: ensure all dates are valid (not NaT)
-    if pd.isna(t_end) or pd.isna(v_end) or pd.isna(te_end):
-        # Last resort: use simple split
-        n = len(idx)
-        if n < 3:
-            raise ValueError(f"Not enough data points ({n}) for train/val/test split.")
-        i_tr = max(1, n // 3)
-        i_va = max(i_tr + 1, 2 * n // 3)
-        i_te = n - 1
-        
-        # Get dates with NaT checking
-        t_end_val = idx[i_tr] if i_tr < len(idx) else idx[0]
-        v_end_val = idx[i_va] if i_va < len(idx) else idx[min(i_tr + 1, n - 1)]
-        te_end_val = idx[i_te] if i_te < len(idx) else idx[-1]
-        
-        t_end = t_end_val.normalize() if pd.notna(t_end_val) else dmin
-        v_end = v_end_val.normalize() if pd.notna(v_end_val) else dmax
-        te_end = te_end_val.normalize() if pd.notna(te_end_val) else dmax
+    for name, (P, _) in splits.items():
+        print(f"[split] {name:<5} {len(P):>5} rows  {P.index.min().date()} → {P.index.max().date()}")
 
-    return str(t_end.date()), str(v_end.date()), str(te_end.date())
-
+    return DatasetSplits(prices=prices, feats=feats, **splits)

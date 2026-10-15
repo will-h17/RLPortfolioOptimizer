@@ -53,7 +53,7 @@ Trained Model (saved to artifacts/)
 
 ```
 .
-├── configs/              Configuration files for training and evaluation
+├── configs/              Training configs (each `extends:` a shared file in configs/base/) and eval-grid configs
 ├── data/
 │   ├── raw/             Downloaded market data (CSV files)
 │   └── processed/       Processed price and feature data (Parquet files)
@@ -70,21 +70,27 @@ Trained Model (saved to artifacts/)
 │   ├── baselines.py     Baseline strategy implementations
 │   ├── sweep_costs.py   Cost sensitivity analysis
 │   ├── eval_grid.py     Breadth evaluation across scenarios
+│   ├── walk_forward.py  Walk-forward evaluation over yearly test windows and seeds
+│   ├── callbacks.py     Validation-Sharpe model selection during training
 │   ├── report.py        Visualization and reporting
 │   ├── repro.py         Reproducibility utilities
+│   ├── paths.py         Project directory layout (resolved from the repo root)
 │   └── utils/           Shared utility functions
-├── tests/               Unit tests
+├── tests/               Unit tests (pytest)
 ├── artifacts/           Training run outputs
-└── app.py               Web interface (Dash application)
+├── webapp/              Web interface: shared components, background jobs, and one module per page (pages/)
+├── app.py               Web interface entry point (Dash)
+├── pyproject.toml       Dependencies, extras ([app], [dev]) and tool settings (ruff, pyright, pytest)
+└── constraints.txt      Fully pinned environment, including transitive dependencies
 ```
 
 ## Key Files
 
 ### Core Training Components
 
-**train.py** - Main training orchestrator. Handles the complete training workflow: loads configuration, splits data into train/validation/test sets, fits the feature scaler on training data only, creates the trading environment, builds the PPO agent, runs training with checkpointing and evaluation callbacks, and saves all artifacts to a timestamped directory.
+**train.py** - Main training orchestrator. Handles the complete training workflow: loads configuration, splits data into train/validation/test sets, fits the feature scaler on training data only, creates one or more training environments (`train.n_envs`), builds the PPO agent, runs training with checkpointing, keeps the checkpoint with the best validation Sharpe (`callbacks.py`), and saves all artifacts (including `env_config.json`, used to rebuild the identical env for evaluation) to a timestamped directory.
 
-**env.py** - Implements the trading environment as a Gymnasium-compatible environment. The environment manages portfolio state, processes actions (target portfolio weights), calculates rewards based on returns and transaction costs, and tracks portfolio value over time. Actions are projected to a probability simplex to ensure valid portfolio allocations.
+**env.py** - Implements the trading environment as a Gymnasium-compatible environment. The environment manages portfolio state, processes actions (target portfolio weights), calculates rewards based on returns and transaction costs, and tracks portfolio value over time. Actions are projected to a probability simplex to ensure valid portfolio allocations. Holdings drift with prices between steps, so costs are charged on the trade actually needed (keeping a constant mix requires rebalancing). `info["ret"]` is always the true net return, separate from the (possibly shaped) reward. For training, `random_start` + `episode_length` sample random fixed-length windows; evaluation always runs one full deterministic pass.
 
 **agent.py** - Defines the reinforcement learning agent using Stable Baselines3's PPO algorithm. Implements a custom Dirichlet policy head that outputs portfolio weight allocations. The Dirichlet distribution naturally enforces the constraint that weights sum to one and are non-negative.
 
@@ -108,6 +114,8 @@ Trained Model (saved to artifacts/)
 
 **sweep_costs.py** - Tests how sensitive the trained model is to different transaction cost assumptions. Sweeps costs from 0 to 10 basis points and reports performance degradation.
 
+**walk_forward.py** - The headline evaluation. Trains one agent per yearly test window and seed (expanding training window, 6-month validation window before each test year) and compares it with equal-weight, buy-and-hold, and inverse-variance baselines run through the *same* environment, so costs, cash, and timing are identical. Reports per-fold and stitched full-period out-of-sample results, and can resume an interrupted study.
+
 **eval_grid.py** - Runs comprehensive evaluation across multiple scenarios: different asset universes, different time periods, and different feature sets. Produces summary statistics for robustness analysis.
 
 **report.py** - Generates visualization reports including equity curves, metrics comparisons, and allocation heatmaps. Automatically finds the latest training run and loads the appropriate model and scaler.
@@ -116,7 +124,7 @@ Trained Model (saved to artifacts/)
 
 **repro.py** - Sets random seeds for reproducibility and collects library version information. Ensures that training runs can be reproduced exactly.
 
-**utils/data_utils.py** - Shared utilities for data alignment and date handling used across multiple modules.
+**utils/data_utils.py** - Shared data preparation: `prepare_dataset(cfg)` loads, aligns and splits the processed data identically for training, HPO and the cost sweep, and raises a clear error if the configured split dates leave any split empty.
 
 **utils/logging.py** - Logging setup for training progress and TensorBoard integration.
 
@@ -126,10 +134,14 @@ This section provides a step-by-step guide for using the system via the command 
 
 ### Prerequisites
 
-Install required dependencies:
+Create an isolated environment (Python 3.12) and install the project with its pinned dependencies:
 ```bash
-pip install -r requirements.txt
+conda create -n rlpo python=3.12 -y
+conda activate rlpo
+pip install -e ".[app,dev]" -c constraints.txt
 ```
+
+`[app]` adds the Dash web app (see APP_INFO.md) and `[dev]` the test and lint tools; drop either if you don't need it. `constraints.txt` pins every transitive dependency to the versions the test suite was verified against. `requirements.txt` and `requirements_app.txt` still work for `pip install -r` and install the same thing.
 
 ### Step 1: Unit Tests
 
@@ -178,20 +190,34 @@ Train the RL agent. Start with a quick test run to verify everything works:
 python -m src.train --config configs/test_quick.yaml
 ```
 
-This uses a configuration with fewer training steps (10,000) for quick verification. Once confirmed, run a full training:
+This uses a configuration with fewer training steps (10,000) for quick verification. Once confirmed, run a full training with the recommended configuration:
 
 ```bash
-python -m src.train --config configs/rlppo.yaml
+python -m src.train --config configs/rlppo_v2.yaml
 ```
+
+`rlppo_v2.yaml` trains on random one-year windows across 8 parallel environments with a plain net-return reward under realistic ETF costs, and keeps the checkpoint with the best validation Sharpe. It takes about 2.5 minutes for 1,000,000 timesteps on a laptop CPU. The older `rlppo*.yaml` configs keep their original behavior.
 
 Training creates a directory under `artifacts/` with timestamp and run name. The directory contains:
 - `config.json` - Frozen configuration for this run
 - `versions.json` - Library versions and seeds
 - `scaler.json` - Fitted feature scaler
 - `models/` - Model checkpoints and best model
-- `eval/metrics.json` - Evaluation metrics
+- `env_config.json` - Exact environment settings, used by every evaluation tool
+- `eval/val_sharpe.csv` - Validation Sharpe at each evaluation (the best one is `models/best/best_model.zip`)
+- `metrics.json` - Test-split metrics
 
-Training typically takes 15-30 minutes for 2,000,000 timesteps depending on hardware. Monitor the console output for progress updates.
+Monitor the console output for progress updates.
+
+### Step 4b: Walk-Forward Evaluation (recommended)
+
+A single test window says little about a strategy. Walk-forward evaluation retrains for each test year and several seeds, and compares against baselines under identical costs:
+
+```bash
+python -m src.walk_forward --config configs/rlppo_v2.yaml --seeds 0 1 2 --first-test-year 2016
+```
+
+This trains one model per (test year, seed): 30 runs, roughly 75 minutes with the v2 config. Use `--timesteps 50000` for a quick check. Results go to `artifacts/walk_forward/<name>/` (`summary.csv`, `runs.csv`, dated daily `returns.csv`); re-running with the same `--name` resumes where it stopped.
 
 ### Step 5: Evaluation
 
@@ -199,7 +225,7 @@ Evaluate the trained model against baselines:
 
 ```bash
 # Find the latest training run
-LATEST_RUN=$(ls -td artifacts/*__ppo_dirichlet_baseline | head -1)
+LATEST_RUN=$(ls -td artifacts/*__* | head -1)
 
 # Run backtest comparison
 python -m src.backtest --run_dir $LATEST_RUN
@@ -261,7 +287,7 @@ python -m src.hpo.run_optuna \
     --output-dir artifacts/hpo
 ```
 
-This runs multiple training trials with different hyperparameters and finds the best combination. Each trial trains a full model, so this can take 10-15 hours for 30 trials. Results are saved as JSON files in the output directory.
+This runs multiple training trials with different hyperparameters and finds the best combination. Each trial trains a full model, so this can take 10-15 hours for 30 trials. Results are saved as YAML files in the output directory.
 
 You can resume an interrupted study:
 ```bash
@@ -275,18 +301,31 @@ python -m src.hpo.run_optuna \
 
 ## Configuration Files
 
-Configuration files are YAML files that specify all parameters for training and evaluation. Key sections include:
+Configuration files are YAML files that specify all parameters for training and evaluation. They are validated when loaded: unknown keys (such as a misspelled `hpo.train_timestep`), out-of-range values, and inconsistent settings (for example `env.random_start` without `env.episode_length`) stop with an error that names the field.
+
+A config can inherit from another with `extends:` (a path relative to the file). Sections are merged and the child's values win, so each config only lists what makes it different:
+
+```yaml
+extends: base/common.yaml   # shared paths, dates, cash rate, ...
+run_name: "my_experiment"
+ppo:
+  learning_rate: 0.0001     # every other ppo.* setting comes from the base
+```
+
+`configs/base/common.yaml` holds the settings every config shares, and `configs/base/legacy.yaml` the shared setup of the original `rlppo*` configs. Key sections include:
 
 - `run_name` - Identifier for this training run
 - `seed` - Random seed for reproducibility
 - `paths` - File paths for data and output
 - `dates` - Train/validation/test period boundaries
-- `env` - Environment parameters (costs, cash rate, etc.)
+- `env` - Environment parameters (cash rate, reward mode, random training windows via `random_start` / `episode_length`, optional reward shaping)
 - `reward` - Reward function parameters
-- `ppo` - PPO hyperparameters (learning rate, network size, etc.)
-- `train` - Training parameters (timesteps, checkpoint frequency, etc.)
+- `ppo` - PPO hyperparameters (learning rate, network size, `alpha_floor` for the Dirichlet policy, `normalize_reward`, etc.)
+- `train` - Training parameters (timesteps, `n_envs` parallel environments, checkpoint and validation frequency)
+- `cost_model` - Transaction costs: fees, slippage, and a fixed or volatility-scaled bid-ask spread
+- `hpo` - Hyperparameter search settings (`train_timesteps` per trial)
 
-Example configurations are provided in the `configs/` directory. Start with `test_quick.yaml` for quick testing, then use `rlppo.yaml` or `rlppo_sharpe_optimized.yaml` for production training.
+Example configurations are provided in the `configs/` directory. Start with `test_quick.yaml` for quick testing, then use `rlppo_v2.yaml` (recommended) for full training. The older `rlppo.yaml`, `rlppo_improved.yaml`, `rlppo_profitable.yaml`, and `rlppo_sharpe_optimized.yaml` use reward shaping and a single full-history episode; they are kept for comparison with earlier runs.
 
 ## Understanding Results
 
@@ -308,7 +347,24 @@ Compare these metrics against baseline strategies to assess whether the RL agent
 
 **Memory errors**: Reduce batch size or number of parallel environments. The default configuration should work on most systems, but very large feature sets may require adjustment.
 
-**Import errors**: Ensure all dependencies are installed. Use `pip install -r requirements.txt` if a requirements file is provided, or install packages individually.
+**Import errors**: Activate the project environment and install it: `pip install -e ".[app,dev]" -c constraints.txt`.
+
+**Config errors**: The message lists each invalid field with the reason, e.g. `ppo.batch_size (1024) exceeds the samples per update`. Fix the named field in the config (or in the base file it extends).
+
+## Development
+
+Run these inside the activated project environment:
+
+```bash
+ruff check .        # lint (style and likely bugs); `ruff check --fix .` applies safe fixes
+pyright             # static type check
+pytest -q           # tests; data-dependent tests skip when data/ or artifacts/ are missing
+pre-commit install  # one-time: run ruff, pyright and repository checks before every commit
+```
+
+GitHub Actions (`.github/workflows/ci.yml`) runs ruff, pyright and pytest on every push to `main` and on pull requests, with a CPU-only PyTorch build.
+
+The source package is named `src` because saved models pickle their policy class as `src.agent.DirichletActorCriticPolicy`; renaming the package would make existing runs unloadable.
 
 ## Next Steps
 

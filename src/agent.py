@@ -3,26 +3,28 @@ agent.py — SB3 PPO with a Dirichlet policy head for simplex actions, version-s
 """
 
 from __future__ import annotations
-from typing import List, Optional, Tuple, Dict, Any
+
+from typing import Any
+
 import torch as th
 import torch.nn as nn
 import torch.nn.functional as F
-
-from stable_baselines3.common.policies import ActorCriticPolicy
 from stable_baselines3 import PPO
-
+from stable_baselines3.common.policies import ActorCriticPolicy
 
 # ---------------- Dirichlet distribution wrapper ---------------- #
 
 class _DirichletWrapper:
     """Light wrapper around torch.distributions.Dirichlet with helpers SB3 expects."""
-    def __init__(self, action_dim: int):
+    def __init__(self, action_dim: int, alpha_floor: float = 1e-3):
         self.action_dim = action_dim
-        self.alpha: Optional[th.Tensor] = None  # (batch, K)
+        self.alpha_floor = alpha_floor
+        self.alpha: th.Tensor | None = None  # (batch, K)
 
-    def set_params_from_logits(self, logits: th.Tensor) -> "_DirichletWrapper":
-        # Softplus ensures strictly positive concentration; add tiny epsilon
-        self.alpha = F.softplus(logits) + 1e-3
+    def set_params_from_logits(self, logits: th.Tensor) -> _DirichletWrapper:
+        # Softplus ensures strictly positive concentration. Alphas below 1 push samples into the
+        # simplex corners (all-in on one asset) with unstable log-probs; a floor of 1.0 avoids that.
+        self.alpha = F.softplus(logits) + self.alpha_floor
         return self
 
     def sample(self, deterministic: bool = False) -> th.Tensor:
@@ -57,39 +59,39 @@ class DirichletActorCriticPolicy(ActorCriticPolicy):
     """
     Actor-Critic policy whose actor head outputs Dirichlet alphas.
     We DO NOT modify SB3's internal distribution registration.
+
+    alpha_floor is stored with the model, so saved models keep the floor they were trained with
+    (models saved before it existed load with the old default of 1e-3).
     """
+
+    def __init__(self, *args, alpha_floor: float = 1e-3, **kwargs):
+        self.alpha_floor = alpha_floor  # must be set before the base class builds the network
+        super().__init__(*args, **kwargs)
+
+    def _get_constructor_parameters(self) -> dict[str, Any]:
+        data = super()._get_constructor_parameters()
+        data["alpha_floor"] = self.alpha_floor
+        return data
 
     def _build_mlp_extractor(self) -> None:
         # Build default extractor (sets self.mlp_extractor, value_net later in base _build)
         super()._build_mlp_extractor()
 
-        # Determine latent dims in a version-safe way
-        if hasattr(self.mlp_extractor, "latent_dim_pi"):
-            latent_dim_pi = self.mlp_extractor.latent_dim_pi
-            latent_dim_vf = self.mlp_extractor.latent_dim_vf
-        else:
-            # Fall back: infer from last layers (older SB3s)
-            pol_net = getattr(self.mlp_extractor, "policy_net", None)
-            val_net = getattr(self.mlp_extractor, "value_net", None)
-            if isinstance(pol_net, nn.Sequential) and len(pol_net) > 0 and hasattr(pol_net[-1], "out_features"):
-                latent_dim_pi = pol_net[-1].out_features
-            else:
-                raise RuntimeError("Could not resolve latent_dim_pi from mlp_extractor.")
-            if isinstance(val_net, nn.Sequential) and len(val_net) > 0 and hasattr(val_net[-1], "out_features"):
-                latent_dim_vf = val_net[-1].out_features
-            else:
-                raise RuntimeError("Could not resolve latent_dim_vf from mlp_extractor.")
+        latent_dim_pi = self.mlp_extractor.latent_dim_pi
+        latent_dim_vf = self.mlp_extractor.latent_dim_vf
 
         # Our Dirichlet head: latent_pi -> logits (then softplus -> alphas)
-        self._dirichlet = _DirichletWrapper(self.action_space.shape[0])
-        self.action_net = nn.Linear(latent_dim_pi, self.action_space.shape[0])
+        assert self.action_space.shape is not None
+        n_actions = int(self.action_space.shape[0])
+        self._dirichlet = _DirichletWrapper(n_actions, self.alpha_floor)
+        self.action_net = nn.Linear(latent_dim_pi, n_actions)
 
         # Rebuild value head explicitly
         self.value_net = nn.Linear(latent_dim_vf, 1)
 
     # ---- Core overrides SB3 PPO uses ---- #
 
-    def forward(self, obs: th.Tensor, deterministic: bool = False) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def forward(self, obs: th.Tensor, deterministic: bool = False) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         features = self.extract_features(obs)
         latent_pi, latent_vf = self.mlp_extractor(features)
 
@@ -114,7 +116,7 @@ class DirichletActorCriticPolicy(ActorCriticPolicy):
         logits = self.action_net(latent_pi)
         return self._dirichlet.set_params_from_logits(logits)
 
-    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> Tuple[th.Tensor, th.Tensor, th.Tensor]:
+    def evaluate_actions(self, obs: th.Tensor, actions: th.Tensor) -> tuple[th.Tensor, th.Tensor, th.Tensor]:
         """
         PPO training path: returns (values, log_prob, entropy)
         """
@@ -138,8 +140,9 @@ class DirichletActorCriticPolicy(ActorCriticPolicy):
 def make_sb3_ppo(
     env,
     learning_rate: float = 3e-4,
-    policy_hidden_sizes: Optional[List[int]] = None,
-    policy_kwargs: Optional[Dict[str, Any]] = None,
+    policy_hidden_sizes: list[int] | None = None,
+    policy_kwargs: dict[str, Any] | None = None,
+    alpha_floor: float = 1e-3,
     **ppo_kwargs,   # <--- accept arbitrary PPO kwargs
 ):
     """
@@ -147,12 +150,14 @@ def make_sb3_ppo(
     - learning_rate: float
     - policy_hidden_sizes: e.g., [128, 128] for pi/vf MLPs
     - policy_kwargs: forwarded to policy
+    - alpha_floor: minimum Dirichlet concentration (see DirichletActorCriticPolicy)
     - **ppo_kwargs: forwarded directly to PPO(...) (gamma, gae_lambda, n_steps, batch_size, clip_range, ent_coef, etc.)
     """
     hidden = policy_hidden_sizes or [128, 128]
 
     default_policy_kwargs = dict(
-        net_arch=dict(pi=hidden, vf=hidden)
+        net_arch=dict(pi=hidden, vf=hidden),
+        alpha_floor=alpha_floor,
     )
 
     if policy_kwargs is None:
@@ -167,6 +172,7 @@ def make_sb3_ppo(
         learning_rate=learning_rate,
         policy_kwargs=final_policy_kwargs,
         verbose=1,
+        device="cpu",   # small MLP policies train faster on CPU than on GPU/MPS
         **ppo_kwargs,   # <--- forward everything else to SB3
     )
     return model

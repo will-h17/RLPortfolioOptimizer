@@ -6,23 +6,20 @@ Index aligns to input prices. Rows with NaNs from rolling windows are dropped.
 """
 
 from __future__ import annotations
+
+from collections.abc import Iterable
 from pathlib import Path
-from typing import Iterable, Optional
+
 import numpy as np
 import pandas as pd
 
-# Paths
-SRC_DIR = Path(__file__).resolve().parent
-PROJECT_ROOT = SRC_DIR.parent
-DATA_DIR = PROJECT_ROOT / "data"
-PROC_DIR = DATA_DIR / "processed"
-PROC_DIR.mkdir(parents=True, exist_ok=True)
+from src.paths import FEATURES_PATH, PRICES_PATH
 
 
 def make_features(
     prices: pd.DataFrame,
     lookbacks: Iterable[int] = (5, 20),
-    out_path: Path | str = PROC_DIR / "features.parquet",
+    out_path: Path | str = FEATURES_PATH,
 ) -> pd.DataFrame:
     """
     Compute returns, log-returns, momentum, rolling vol, and EMA trend per asset.
@@ -69,8 +66,7 @@ def make_features(
 
 # CLI
 if __name__ == "__main__":
-    prices_path = PROC_DIR / "prices_adj.parquet"
-    if not prices_path.exists():
-        raise SystemExit(f"Missing {prices_path}. Run src/data.py first.")
-    prices = pd.read_parquet(prices_path)
+    if not PRICES_PATH.exists():
+        raise SystemExit(f"Missing {PRICES_PATH}. Run: python -m src.data")
+    prices = pd.read_parquet(PRICES_PATH)
     make_features(prices)

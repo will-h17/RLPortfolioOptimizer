@@ -1,8 +1,11 @@
 from __future__ import annotations
-from pathlib import Path
+
 import json
-import numpy as np
+from pathlib import Path
+from typing import cast
+
 import pandas as pd
+
 
 class FitOnTrainScaler:
     """
@@ -13,10 +16,9 @@ class FitOnTrainScaler:
         self.mu_: pd.Series | None = None
         self.sigma_: pd.Series | None = None
 
-    def fit(self, X_train: pd.DataFrame) -> "FitOnTrainScaler":
-        mu = X_train.mean(axis=0)
-        sigma = X_train.std(axis=0).replace(0.0, 1.0)
-        self.mu_, self.sigma_ = mu, sigma
+    def fit(self, X_train: pd.DataFrame) -> FitOnTrainScaler:
+        self.mu_ = cast(pd.Series, X_train.mean(axis=0))
+        self.sigma_ = cast(pd.Series, X_train.std(axis=0)).replace(0.0, 1.0)
         return self
 
     def transform(self, X: pd.DataFrame) -> pd.DataFrame:
@@ -32,7 +34,7 @@ class FitOnTrainScaler:
         path.parent.mkdir(parents=True, exist_ok=True)
 
         # Ensure scaler was fitted
-        if getattr(self, "mu_", None) is None or getattr(self, "sigma_", None) is None:
+        if self.mu_ is None or self.sigma_ is None:
             raise RuntimeError("Scaler not fitted. Call fit(X_train) before save().")
 
         # JSON keys must be strings; MultiIndex / tuple keys are converted to strings here
@@ -52,7 +54,7 @@ class FitOnTrainScaler:
     
 
     @classmethod
-    def load(cls, path: str | Path, columns=None) -> "FitOnTrainScaler":
+    def load(cls, path: str | Path, columns=None) -> FitOnTrainScaler:
         path = Path(path)
         payload = json.loads(path.read_text())
 

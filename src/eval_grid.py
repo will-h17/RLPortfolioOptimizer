@@ -1,34 +1,28 @@
 from __future__ import annotations
-import argparse, json, re, glob, os
-from dataclasses import dataclass
-from pathlib import Path
-from typing import Dict, List, Optional, Tuple
 
-import numpy as np
+import argparse
+import json
+import re
+from pathlib import Path
+
 import pandas as pd
 
-from src.scaler import FitOnTrainScaler
-from src.repro import set_global_seed
 from src.backtest import evaluate_sb3_model
-from src.utils.data_utils import align_dataframes
 from src.baselines import (
     CostCfg,
-    vt_equal_weight,
+    _run_backtest,
     ivp_inverse_variance,
     momentum_xs,
-    _run_backtest,
+    vt_equal_weight,
 )
-
-ROOT = Path(__file__).resolve().parent.parent
-PROC = ROOT / "data" / "processed"
+from src.env import EnvConfig, load_run_env_config
+from src.paths import ARTIFACTS_DIR, FEATURES_PATH, PRICES_PATH, resolve
+from src.repro import set_global_seed
+from src.runlog import latest_run, resolve_run_model
+from src.scaler import FitOnTrainScaler
+from src.utils.data_utils import align_dataframes
 
 # helpers
-
-def _auto_latest_run(artifacts_root: Path) -> Path:
-    runs = sorted(artifacts_root.glob("*__*"), key=os.path.getmtime)
-    if not runs:
-        raise FileNotFoundError("No run folders in artifacts/. Train first.")
-    return runs[-1]
 
 def _load_cfg(p: str | Path) -> dict:
     p = Path(p)
@@ -43,10 +37,11 @@ def _select_universe(prices: pd.DataFrame, tickers) -> pd.DataFrame:
     cols = [c for c in prices.columns if c in set(tickers)]
     if not cols:
         raise ValueError(f"No matching tickers in prices for {tickers}")
-    return prices[cols]
+    return prices.loc[:, cols]
 
 def _slice_period(df: pd.DataFrame, start: str, end: str) -> pd.DataFrame:
-    s = pd.to_datetime(start); e = pd.to_datetime(end)
+    s = pd.to_datetime(start)
+    e = pd.to_datetime(end)
     mask = (df.index >= s) & (df.index <= e)
     out = df.loc[mask]
     return out
@@ -64,15 +59,15 @@ def _filter_features(feats: pd.DataFrame, keep_pat: str) -> pd.DataFrame:
         keep = [c for c in feats.columns if pat.search(str(c))]
     if not keep:
         raise ValueError(f"feature_keep='{keep_pat}' kept zero columns")
-    return feats[keep]
+    return feats.loc[:, keep]
 
 
-def _eval_rl(P: pd.DataFrame, Xz: pd.DataFrame, model_zip: Path) -> Dict[str, float]:
-    res = evaluate_sb3_model(P, Xz, str(model_zip))
+def _eval_rl(P: pd.DataFrame, Xz: pd.DataFrame, model_zip: Path, env_cfg: EnvConfig) -> dict[str, float]:
+    res = evaluate_sb3_model(P, Xz, str(model_zip), env_cfg)
     m = res["metrics"]
     return dict(sharpe=m["sharpe"], max_drawdown=m["max_drawdown"], turnover=m["turnover"], steps=len(res["equity_curve"]))
 
-def _eval_baselines(P: pd.DataFrame, feats_raw: Optional[pd.DataFrame], ab_cfg: dict, bl_cfg: dict) -> List[Dict[str, object]]:
+def _eval_baselines(P: pd.DataFrame, feats_raw: pd.DataFrame | None, ab_cfg: dict, bl_cfg: dict) -> list[dict[str, object]]:
     rows = []
     # cost: use flat_fraction when enabled=False (simpler for ablations)
     flat = float(ab_cfg.get("cost_bps", 0)) / 10_000.0
@@ -147,20 +142,19 @@ def main():
     grid = _load_cfg(args.grid)
 
     # Locate run & artifacts (model + scaler)
-    artifacts = ROOT / "artifacts"
-    run_dir = Path(grid.get("run_dir") or _auto_latest_run(artifacts))
+    run_dir = resolve(grid["run_dir"]) if grid.get("run_dir") else latest_run(ARTIFACTS_DIR)
     scaler_path = run_dir / "scaler.json"
-    best_zip = run_dir / "models" / "best" / "best_model.zip"
     if not scaler_path.exists():
         raise FileNotFoundError(f"Missing scaler.json at {scaler_path}")
-    model_zip = best_zip if best_zip.exists() else (run_dir / "models" / "ppo_dirichlet_sb3.zip")
+    model_zip = resolve_run_model(run_dir)
+    env_cfg = load_run_env_config(run_dir)
 
     # Global seed for determinism
     set_global_seed( int(grid.get("seed", 1337)) , deterministic=True)
 
     # Load data
-    prices_all = pd.read_parquet(PROC / "prices_adj.parquet")
-    feats_all  = pd.read_parquet(PROC / "features.parquet")
+    prices_all = pd.read_parquet(PRICES_PATH)
+    feats_all  = pd.read_parquet(FEATURES_PATH)
 
     # Load scaler once before loops
     scaler = FitOnTrainScaler.load(scaler_path, columns=feats_all.columns)
@@ -175,7 +169,7 @@ def main():
     scaler_cols = list(scaler_cols)
 
     # Results accumulator
-    rows: List[Dict[str, object]] = []
+    rows: list[dict[str, object]] = []
 
     # Iterate scenarios
     for uname, udef in grid["universes"].items():
@@ -220,7 +214,7 @@ def main():
                 # For baselines: use filtered features (if different from RL)
                 # Transform filtered features using pre-loaded scaler
                 keep_cols = [c for c in F_s.columns if c in set(scaler_cols)]
-                X_s = F_s[keep_cols] if keep_cols else F_s
+                X_s = F_s.loc[:, keep_cols] if keep_cols else F_s
                 X_sz = scaler.transform(X_s) if keep_cols else F_s
 
                 # Align transformed features to prices (defensive)
@@ -229,7 +223,7 @@ def main():
 
                 # RL eval (use full feature set to match training observation space)
                 try:
-                    m_rl = _eval_rl(P_rl, X_rl, model_zip)
+                    m_rl = _eval_rl(P_rl, X_rl, model_zip, env_cfg)
                     rows.append(dict(model="RL", universe=uname, period=pname, ablation=ab_name, **m_rl))
                 except Exception as e:
                     error_msg = f"{type(e).__name__}: {e}"

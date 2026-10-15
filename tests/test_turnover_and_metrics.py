@@ -1,6 +1,9 @@
 import numpy as np
+
+from src.utils.metrics import max_drawdown as max_dd
+from src.utils.metrics import sharpe_ratio as sharpe
 from src.utils.metrics import turnover as avg_turnover
-from src.utils.metrics import max_drawdown as max_dd, sharpe_ratio as sharpe
+
 
 def test_turnover_l1_mean():
     W = np.array([

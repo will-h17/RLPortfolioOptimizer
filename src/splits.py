@@ -1,7 +1,10 @@
 from __future__ import annotations
+
+from collections.abc import Iterator
 from dataclasses import dataclass
-from typing import Iterable, Iterator, Tuple, Optional
+
 import pandas as pd
+
 
 @dataclass(frozen=True)
 class TimeSplit:
@@ -29,7 +32,7 @@ def walk_forward(index: pd.DatetimeIndex,
                  train_len: int,
                  val_len: int,
                  test_len: int,
-                 step: Optional[int]=None) -> Iterator[TimeSplit]:
+                 step: int | None=None) -> Iterator[TimeSplit]:
     """
     Rolling windows in *rows* (bars). Yields TimeSplit with integer slices.
     """

@@ -8,28 +8,30 @@ backtest.py — Evaluate trading strategies (RL agent & baselines).
 """
 
 from __future__ import annotations
-from typing import Callable, Dict, Any
+
+from collections.abc import Callable
+from pathlib import Path
+from typing import Any
+
 import numpy as np
 import pandas as pd
 from stable_baselines3 import PPO
-from pathlib import Path
-
-from src.scaler import FitOnTrainScaler
-from src.utils.data_utils import align_dataframes
-from src.utils.metrics import sharpe_ratio, max_drawdown, turnover
 
 # Baselines module
 from src.baselines import (
     CostCfg,
-    vt_equal_weight,
+    _run_backtest,  # engine to execute with costs
     ivp_inverse_variance,
     momentum_xs,
-    _run_backtest,  # engine to execute with costs
+    vt_equal_weight,
 )
+from src.env import EnvConfig, PortfolioEnv, load_run_env_config
+from src.paths import ARTIFACTS_DIR, FEATURES_PATH, PRICES_PATH
+from src.runlog import latest_run, resolve_run_model
+from src.scaler import FitOnTrainScaler
+from src.utils.data_utils import align_dataframes
+from src.utils.metrics import max_drawdown, sharpe_ratio, turnover
 
-PROC = Path(__file__).resolve().parent.parent / "data" / "processed"
-ART  = Path(__file__).resolve().parent.parent / "artifacts"
-ART.mkdir(parents=True, exist_ok=True)
 
 # Simple backtest engine (for Buy&Hold / Equal-Weight baselines)
 def run_backtest(
@@ -37,41 +39,44 @@ def run_backtest(
     features: pd.DataFrame,
     policy_fn: Callable[[np.ndarray, np.ndarray, int], np.ndarray],
     start_value: float = 1.0,
-) -> Dict[str, Any]:
+) -> dict[str, Any]:
     """
-    Simulate portfolio evolution using a policy function
+    Simulate portfolio evolution using a policy function (no transaction costs).
+
+    At each day t the policy sees features_t and the current (drifted) holdings, and
+    returns target weights that earn the *next* day's return P[t+1]/P[t] - 1.
+    Turnover is measured as |target - drifted holdings|, i.e. what was actually traded.
     """
     prices, features = align_dataframes(prices, features, dropna=False, context="backtest")
     T, N = prices.shape
-    rets_assets = prices.pct_change().fillna(0.0).to_numpy()  # (T, N)
+    rets_assets = prices.pct_change().fillna(0.0).to_numpy()  # row t = P[t]/P[t-1] - 1
 
     equity = np.empty(T, dtype=np.float64)
     equity[0] = start_value
 
     weights = np.empty((T, N), dtype=np.float64)
-    w_prev = np.ones(N) / N  # start equal
-    weights[0] = w_prev
+    trades = np.zeros(T, dtype=np.float64)
+    w_held = np.ones(N) / N  # start equal
+    weights[0] = w_held
 
-    for t in range(1, T):
+    for t in range(T - 1):
         feats_t = features.iloc[t].to_numpy(dtype=np.float64)
 
-        # Ask policy for today's target weights given features_t and previous weights
-        w = policy_fn(feats_t, w_prev, t)
-        w = np.asarray(w, dtype=np.float64).ravel()
+        # Ask policy for target weights given information up to t and current holdings
+        w = policy_fn(feats_t, w_held, t)
+        w = np.maximum(np.asarray(w, dtype=np.float64).ravel(), 0.0)
         if w.size != N:
             raise ValueError(f"policy_fn returned {w.size} weights but N={N}")
         s = w.sum()
-        if s <= 0:
-            w = np.ones(N) / N
-        else:
-            w = np.maximum(w, 0.0) / s  # simple normalization/clip
+        w = np.ones(N) / N if s <= 0 else w / s
+        trades[t] = np.abs(w - w_held).sum()
 
-        weights[t] = w
-
-        # Realize today's return
-        port_ret = float(np.dot(w, rets_assets[t]))
-        equity[t] = equity[t - 1] * (1.0 + port_ret)
-        w_prev = w
+        # Realize the next day's return, then let holdings drift with prices
+        r_next = rets_assets[t + 1]
+        port_ret = float(np.dot(w, r_next))
+        equity[t + 1] = equity[t] * (1.0 + port_ret)
+        w_held = w * (1.0 + r_next) / (1.0 + port_ret)
+        weights[t + 1] = w_held
 
     # Metrics
     port_rets = pd.Series(equity).pct_change().dropna().to_numpy()
@@ -79,101 +84,87 @@ def run_backtest(
         "final_value": float(equity[-1]),
         "sharpe": sharpe_ratio(port_rets),
         "max_drawdown": max_drawdown(equity, return_positive=True),  # Return positive value for consistency
-        "turnover": turnover(weights),
+        "turnover": float(trades[1:T - 1].mean()) if T > 2 else 0.0,  # excludes the initial allocation
     }
 
     return {"equity_curve": equity, "weights": weights, "metrics": metrics}
 
 # Simple baselines (legacy): Buy & Hold, Equal Weight
-def buy_and_hold(prices: pd.DataFrame, features: pd.DataFrame) -> Dict[str, Any]:
-    N = prices.shape[1]
-    w0 = np.ones(N) / N
-    def policy_fn(features_t, w_prev, t):
-        return w0  # never rebalance
+def buy_and_hold(prices: pd.DataFrame, features: pd.DataFrame) -> dict[str, Any]:
+    def policy_fn(features_t, w_held, t):
+        return w_held  # start equal-weight, never rebalance; weights drift with prices
     return run_backtest(prices, features, policy_fn)
 
-def equal_weight(prices: pd.DataFrame, features: pd.DataFrame) -> Dict[str, Any]:
+def equal_weight(prices: pd.DataFrame, features: pd.DataFrame) -> dict[str, Any]:
     N = prices.shape[1]
-    def policy_fn(features_t, w_prev, t):
+    def policy_fn(features_t, w_held, t):
         return np.ones(N) / N  # rebalance daily to equal
     return run_backtest(prices, features, policy_fn)
 
-# Evaluate an SB3 PPO model in the custom env
-def evaluate_sb3_model(prices: pd.DataFrame, features: pd.DataFrame, model_path: str) -> Dict[str, Any]:
-    from src.env import PortfolioEnv, EnvConfig
-    env = PortfolioEnv(prices, features, EnvConfig())
-    model = PPO.load(model_path, device="cpu")
-
-    equity = [1.0]
-    weights = []
-    state, _ = env.reset()
+def rollout_policy(model, env: PortfolioEnv) -> dict[str, np.ndarray]:
+    """
+    Run one deterministic episode of `model` in `env` (a raw PortfolioEnv, not a VecEnv).
+    Returns per-step net returns, post-trade weights, trade sizes (L1), and portfolio values.
+    """
+    obs, _ = env.reset()
+    rets, weights, trades, values = [], [], [], []
     done = False
-
-    # keep a running portfolio value in case env.info doesn't include "value"
-    value = 1.0
     while not done:
-        action, _ = model.predict(state, deterministic=True)
-        state, reward, done, trunc, info = env.step(action)
+        action, _ = model.predict(obs, deterministic=True)
+        obs, _, terminated, truncated, info = env.step(action)
+        done = terminated or truncated
+        rets.append(info["ret"])
+        weights.append(info["weights"])
+        trades.append(info["turnover"])
+        values.append(info["value"])
+    return {"returns": np.asarray(rets), "weights": np.asarray(weights),
+            "trades": np.asarray(trades), "values": np.asarray(values)}
 
-        weights.append(info.get("weights"))
 
-        # prefer explicit info["value"], else use info["ret"], else fall back to reward
-        if info is not None and "value" in info and info["value"] is not None:
-            value = float(info["value"])
-        elif info is not None and "ret" in info and info["ret"] is not None:
-            value = value * (1.0 + float(info["ret"]))
-        else:
-            # best-effort fallback: treat reward as an arithmetic return
-            try:
-                value = value * (1.0 + float(reward))
-            except Exception:
-                # if even that fails, keep last value (avoids crash)
-                value = value
+# Evaluate an SB3 PPO model in the custom env
+def evaluate_sb3_model(
+    prices: pd.DataFrame,
+    features: pd.DataFrame,
+    model_path: str,
+    env_cfg: EnvConfig,
+) -> dict[str, Any]:
+    """
+    Roll out a trained model deterministically over the whole period. env_cfg must be the config
+    the model was trained with (see src.env.load_run_env_config) so costs, cash and observations
+    match; training-only episode settings (random windows) are switched off.
+    """
+    env = PortfolioEnv(prices, features, env_cfg.for_evaluation())
+    model = PPO.load(model_path, device="cpu")
+    res = rollout_policy(model, env)
 
-        equity.append(value)
-
-    equity = np.array(equity[1:])
-    weights = np.array(weights)
-    rets_port = pd.Series(equity).pct_change().dropna().to_numpy()
+    equity, weights = res["values"], res["weights"]
     metrics = {
         "final_value": float(equity[-1]),
-        "sharpe": sharpe_ratio(rets_port),
+        "sharpe": sharpe_ratio(res["returns"]),
         "max_drawdown": max_drawdown(equity, return_positive=True),  # Return positive value for consistency
         "turnover": turnover(weights),
     }
-    return {"equity_curve": equity, "weights": weights, "metrics": metrics}
+    return {"equity_curve": equity, "weights": weights, "returns": res["returns"], "metrics": metrics}
 
 # Main CLI entry point
 if __name__ == "__main__":
-    import argparse, glob
+    import argparse
 
     ap = argparse.ArgumentParser()
     ap.add_argument("--run_dir", default="", help="Path to a run folder under artifacts/ (contains scaler.json, models/)")
     args = ap.parse_args()
 
-    # Resolve run_dir: use provided path or auto-pick latest artifacts/*__*
-    if args.run_dir:
-        RUN = Path(args.run_dir).resolve()
-    else:
-        runs = sorted((ART).glob("*__*"))
-        if not runs:
-            raise FileNotFoundError(
-                "No run folders found under artifacts/. "
-                "Run training first: python -m src.train --config configs/rlppo.yaml"
-            )
-        RUN = runs[-1]
-
+    # Resolve run_dir: use provided path or auto-pick the latest completed run
+    RUN = Path(args.run_dir).resolve() if args.run_dir else latest_run(ARTIFACTS_DIR)
     scaler_path = RUN / "scaler.json"
-    best_model_path = RUN / "models" / "best" / "best_model.zip"
-    final_model_path = RUN / "models" / "ppo_dirichlet_sb3.zip"  # fallback if saved here
 
     if not scaler_path.exists():
         raise FileNotFoundError(f"scaler.json not found at: {scaler_path}\n"
                                 f"Did you run train.py? Expected inside the run folder.")
 
     # Load data
-    prices = pd.read_parquet(PROC / "prices_adj.parquet")
-    feats   = pd.read_parquet(PROC / "features.parquet")
+    prices = pd.read_parquet(PRICES_PATH)
+    feats   = pd.read_parquet(FEATURES_PATH)
 
     # Load train-fitted scaler
     from src.scaler import FitOnTrainScaler  # ensure package import
@@ -193,15 +184,14 @@ if __name__ == "__main__":
     print("Equal Weight:", ew["metrics"])
 
     # ---------------- RL Agent ---------------------------------
-    rl_zip = best_model_path if best_model_path.exists() else final_model_path
     try:
-        rl = evaluate_sb3_model(prices, feats_z, str(rl_zip))
+        rl = evaluate_sb3_model(prices, feats_z, str(resolve_run_model(RUN)), load_run_env_config(RUN))
         print("RL Agent (SB3):", rl["metrics"])
     except Exception as e:
         print("RL Agent (SB3): skipped or failed ->", repr(e))
 
     # 1) Cost config.
-    from src.baselines import CostCfg, vt_equal_weight, ivp_inverse_variance, momentum_xs, _run_backtest
+    from src.baselines import CostCfg, _run_backtest, ivp_inverse_variance, momentum_xs, vt_equal_weight
     cost_cfg = CostCfg(
         enabled=True,
         fee_bps=0.0,
@@ -245,7 +235,7 @@ if __name__ == "__main__":
     print(df_baselines.to_string(index=False))
 
     # 5) Save alongside the run artifacts
-    out_csv = Path("artifacts") / "baseline_results.csv"
+    out_csv = ARTIFACTS_DIR / "baseline_results.csv"
     out_csv.parent.mkdir(parents=True, exist_ok=True)
     df_baselines.to_csv(out_csv, index=False)
     print(f"Saved baseline results to {out_csv.resolve()}")

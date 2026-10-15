@@ -1,0 +1,80 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rlportfoliooptimizer"
+version = "0.2.0"
+description = "Reinforcement-learning portfolio allocation (PPO with a Dirichlet policy) with cost-aware backtesting and walk-forward evaluation"
+readme = "README.md"
+requires-python = ">=3.12"
+# Pinned to the versions the pipeline and test suite are verified against. constraints.txt
+# additionally pins every transitive dependency (see "Dependencies" in README.md).
+dependencies = [
+    "pandas==2.2.2",
+    "numpy==1.26.4",
+    "pyarrow==16.1.0",        # parquet engine for data/processed/*.parquet
+    "torch==2.8.0",
+    "stable-baselines3==2.7.0",
+    "gymnasium==1.2.0",
+    "tqdm==4.66.5",           # SB3 training progress bar
+    "rich==13.7.1",           # SB3 training progress bar
+    "yfinance==0.2.66",
+    "pyyaml==6.0.1",
+    "pydantic==2.14.1",       # config validation
+    "optuna==4.5.0",
+    "plotly==5.24.1",
+    "matplotlib==3.9.2",
+    "seaborn==0.13.2",
+]
+
+[project.optional-dependencies]
+app = [
+    "dash[diskcache]==4.4.1",  # diskcache extra: background callbacks (cancellable jobs)
+    "dash-bootstrap-components==2.0.4",
+    "psutil==7.2.2",           # stop background jobs when the server exits
+]
+dev = [
+    "pytest==7.4.4",
+    "ruff==0.17.0",
+    "pyright==1.1.414",
+    "pre-commit==4.7.0",
+]
+
+# The package is named `src` (rather than a project-specific name) because every saved model
+# zip pickles its policy class as `src.agent.DirichletActorCriticPolicy`; renaming the package
+# would make existing runs unloadable.
+[tool.setuptools.packages.find]
+include = ["src*", "webapp*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
+addopts = "-p no:cacheprovider"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+extend-exclude = ["artifacts", "data", "reports", "models"]
+
+[tool.ruff.lint]
+select = [
+    "E",    # pycodestyle errors
+    "F",    # pyflakes: unused imports/variables, undefined names
+    "I",    # import sorting
+    "B",    # bugbear: likely bugs
+    "UP",   # pyupgrade: modern syntax for the target Python
+]
+ignore = [
+    "E501",  # line length: the formatter is not applied yet (lint-only for now)
+    "E701",  # multiple statements on one line (compact one-liners exist in a few places)
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["B018"]  # bare expressions used as assertions in tests
+
+[tool.pyright]
+include = ["src", "app.py", "webapp", "tests"]
+pythonVersion = "3.12"
+typeCheckingMode = "basic"
+reportMissingTypeStubs = false

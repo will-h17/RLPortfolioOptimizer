@@ -1,11 +1,12 @@
 from __future__ import annotations
+
 from dataclasses import dataclass
-from typing import Optional, Tuple, Dict, List
+from typing import cast
+
 import numpy as np
 import pandas as pd
 
-from src.utils.metrics import sharpe_ratio, max_drawdown, turnover
-
+from src.utils.metrics import max_drawdown, sharpe_ratio, turnover
 
 # Cost model (fee + slippage + 1/2 spread)
 
@@ -25,8 +26,8 @@ class CostCfg:
 
 def _per_asset_cost_bps(
     t_loc: pd.Timestamp,
-    asset_cols: List[str],
-    features: Optional[pd.DataFrame],
+    asset_cols: list[str],
+    features: pd.DataFrame | None,
     cfg: CostCfg
 ) -> np.ndarray:
     """
@@ -65,8 +66,8 @@ def _apply_cost(
     w_prev: np.ndarray,
     w_new: np.ndarray,
     t_loc: pd.Timestamp,
-    asset_cols: List[str],
-    features: Optional[pd.DataFrame],
+    asset_cols: list[str],
+    features: pd.DataFrame | None,
     cfg: CostCfg
 ) -> float:
     """Return cost as a fraction of portfolio value due to rebalancing at t."""
@@ -78,9 +79,9 @@ def _run_backtest(
     prices: pd.DataFrame,
     target_weights: pd.DataFrame,   # index aligned to prices.index, columns=assets, rows sum to <= 1 (long-only)
     cost_cfg: CostCfg,
-    features: Optional[pd.DataFrame] = None,
+    features: pd.DataFrame | None = None,
     band: float = 0.0               # trade only if |w_target - w_current| L1 > band
-) -> Dict[str, object]:
+) -> dict[str, object]:
     """
     Execute daily portfolio using provided target weights (piecewise-constant between rebalances).
     Applies costs only when we trade (change weights).
@@ -115,7 +116,7 @@ def _run_backtest(
 
         # trade only if band is exceeded (L1 distance)
         if np.sum(np.abs(w_target - w)) > band + 1e-12:
-            cost = _apply_cost(w, w_target, dates[t], assets, features, cost_cfg)
+            cost = _apply_cost(w, w_target, cast(pd.Timestamp, dates[t]), assets, features, cost_cfg)
             w = w_target
 
         port_ret_net = port_ret_gross - cost
@@ -190,7 +191,7 @@ def ivp_inverse_variance(
     """Weights ∝ 1/variance (diagonal covariance)."""
     assets = prices.columns
     rebal_idx = prices.resample(rebalance).last().index.intersection(prices.index)
-    var = _price_to_returns(prices).rolling(window).var()
+    var = cast(pd.DataFrame, _price_to_returns(prices).rolling(window).var())
 
     rows = []
     for t in rebal_idx:
